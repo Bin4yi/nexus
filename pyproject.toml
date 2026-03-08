@@ -1,0 +1,16 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+# Markers
+markers = [
+    "integration: requires Docker services (neo4j, chromadb, redis)",
+]
+
+# Run unit tests by default; use -m integration for Docker tests
+addopts = "-v -m 'not integration'"
+
+# Timeout for tests
+timeout = 30
