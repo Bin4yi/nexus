@@ -59,6 +59,16 @@ py main.py debug <error>  # Root-cause analysis
 | `batch_size` | `BATCH_SIZE` | `500` | Neo4j APOC batch size |
 | `retry_max_attempts` | `RETRY_MAX_ATTEMPTS` | `3` | Tenacity retry attempts |
 | `log_level` | `LOG_LEVEL` | `INFO` | Root log level |
+| `chunk_size` | `CHUNK_SIZE` | `512` | **Sprint 1** — Max tokens per sliding window chunk |
+| `chunk_overlap` | `CHUNK_OVERLAP` | `128` | **Sprint 1** — Token overlap between adjacent windows |
+| `use_fastembed` | `USE_FASTEMBED` | `false` | **Sprint 1** — Enable FastEmbed + ONNX Runtime |
+| `fastembed_model` | `FASTEMBED_MODEL` | `nomic-ai/nomic-embed-text-v1.5` | **Sprint 1** — FastEmbed model (768-dim) |
+| `parser_file_batch_size` | `PARSER_FILE_BATCH_SIZE` | `200` | **Sprint 1** — Files per worker batch (ProcessPoolExecutor) |
+| `osgi_enabled` | `OSGI_ENABLED` | `true` | **Sprint 2** — Enable OSGi RESOLVES_TO edge extraction |
+| `rfc_path` | `RFC_PATH` | `./rfcs` | **Sprint 4** — Directory containing RFC markdown files |
+| `local_drafting_enabled` | `LOCAL_DRAFTING_ENABLED` | `false` | **Sprint 4** — Enable Ollama micro-draft generation |
+| `ollama_base_url` | `OLLAMA_BASE_URL` | `http://localhost:11434` | **Sprint 4** — Ollama API base URL |
+| `ollama_model` | `OLLAMA_MODEL` | `llama3.2:3b` | **Sprint 4** — Ollama model for micro-drafts |
 
 ### `make_llm_client(tier="fast")` — LLM Factory Method
 
@@ -86,11 +96,12 @@ def get_model_name(self, tier: str = "fast") -> str:
 
 | Tier | Model | Where used |
 |---|---|---|
-| `fast` | `gpt-4o-mini` | Community summarisation (bulk), map-step scoring, query expansion, L2 rollup |
+| `fast` | `gpt-4o-mini` | Community summarisation (bulk), map-step scoring, query expansion, flow narratives, L2 rollup |
 | `strong` | `gpt-4o` | Final reduce answer, L3 global rollup only |
 
 This minimises API cost: ~90% of LLM calls use the cheap model.
 A full ingest of 100 repos costs ~$0.50 vs ~$5+ if all operations used gpt-4o.
+Ollama micro-drafts (Sprint 4) cost $0.
 
 ---
 
@@ -122,7 +133,7 @@ A field declared in a class body.
 
 ### `LogicUnit`
 
-The atomic semantic unit — a single Java method or constructor. Maps to a Neo4j `:LogicUnit` node and two ChromaDB vectors.
+The atomic semantic unit — a single Java method or constructor. Maps to a Neo4j `:LogicUnit` node and one or more ChromaDB vectors.
 
 | Field | Type | Description |
 |---|---|---|
@@ -331,6 +342,91 @@ if sys.version_info >= (3, 11):
 
 ---
 
+## `parsers/osgi_parser.py` — OSGi Declarative Services Parser (Sprint 2)
+
+**Purpose**: Resolves OSGi service bindings that are invisible to normal call-graph analysis.
+Scans Java source for `@Component` and `@Reference` annotations, builds `[:RESOLVES_TO]` edges.
+
+### Dataclasses
+
+#### `OSGiComponentInfo`
+
+| Field | Type | Description |
+|---|---|---|
+| `fqn` | `str` | Component class FQN |
+| `service_interfaces` | `list[str]` | Interface FQNs from `@Component(service={...})` |
+| `repo_name` | `str` | Repository name |
+
+#### `OSGiResolutionEdge`
+
+| Field | Type | Description |
+|---|---|---|
+| `interface_fqn` | `str` | Injected interface FQN |
+| `implementation_fqn` | `str` | Resolved implementation FQN |
+| `reference_field` | `str` | Field name carrying the `@Reference` |
+
+### Class: `OSGiParser`
+
+#### `parse_components(java_files, components) → list[OSGiComponentInfo]`
+
+Scans Java files for `@Component(service={Interface.class})` annotations.
+Resolves the service interface FQNs using the component's import map.
+
+#### `build_resolution_edges(java_files, components, osgi_components) → list[OSGiResolutionEdge]`
+
+For each `@Reference Interface field` found in Java source:
+1. Finds the field's declared interface type
+2. Looks up which OSGi component provides that interface
+3. Returns a `OSGiResolutionEdge` linking the field's component to the provider
+
+These edges are loaded into Neo4j as `[:RESOLVES_TO]` relationships and projected into
+the GDS flow graph for Dijkstra path analysis.
+
+---
+
+## `parsers/rfc_parser.py` — RFC Specification Grounding Parser (Sprint 4)
+
+**Purpose**: Parses IETF RFC markdown/text files into `(:Specification)` nodes and links
+Java classes that cite those RFCs via `[:IMPLEMENTS_SPEC]` edges.
+
+### Dataclasses
+
+#### `SpecificationInfo`
+
+| Field | Type | Description |
+|---|---|---|
+| `rfc_number` | `str` | RFC number string (e.g. `"6749"`) |
+| `title` | `str` | RFC title extracted from header |
+| `source_file` | `str` | Path to the RFC file |
+
+#### `SpecImplementsEdge`
+
+| Field | Type | Description |
+|---|---|---|
+| `component_fqn` | `str` | Java class FQN citing the RFC |
+| `rfc_number` | `str` | Referenced RFC number |
+| `citation_context` | `str` | The comment text where the citation was found |
+
+### Class: `RFCParser`
+
+#### `parse_rfc_files(rfc_dir: Path) → list[SpecificationInfo]`
+
+Scans all `*.md` and `*.txt` files in the RFC directory.
+Extracts RFC number and title from the document header.
+
+#### `detect_rfc_citations(java_files, components) → list[SpecImplementsEdge]`
+
+Scans Java source files for inline RFC citations using:
+```python
+_RFC_CITATION_RE = re.compile(r"(?:RFC\s*[-#:]?\s*(\d{3,5}))", re.IGNORECASE)
+```
+
+Matches patterns like: `// RFC 6749`, `// See RFC 7519`, `/* implements RFC 8693 */`
+
+Returns edges linking each citing class to the specification node.
+
+---
+
 ## `parsers/geid.py` — GEID Generator
 
 **Purpose**: Generates the **Global Entity Identifier** — the 16-character hex key shared between Neo4j and ChromaDB.
@@ -371,6 +467,52 @@ Extracts structured data from `/** ... */` comment blocks.
 
 ### `JavadocParser.format_for_embedding(parsed) → str`
 Converts parsed dict to flat text optimised for semantic embedding (no `@tag` noise).
+
+---
+
+## `llm/local_drafting.py` — Ollama Local Micro-Draft Engine (Sprint 4)
+
+**Purpose**: Generates 3-sentence architectural summaries for every `:EntryPoint` Component node
+using a locally running Ollama LLM. Zero API cost, zero internet required.
+
+### Class: `LocalDraftingEngine`
+
+#### `run(max_workers: int = 2) → int`
+
+Fetches all `:EntryPoint` Component nodes from Neo4j, generates micro-drafts in parallel
+using `ThreadPoolExecutor`, and stores results as `micro_draft` property on each node.
+Returns the count of successfully drafted components.
+
+#### `_draft_single(ep: dict) → Optional[str]`
+
+Posts a prompt to the Ollama REST API:
+```python
+requests.post(
+    f"{settings.ollama_base_url}/api/generate",
+    json={"model": settings.ollama_model, "prompt": prompt, "stream": False},
+    timeout=30,
+)
+```
+
+Prompt template: asks for a 3-sentence description of what the API endpoint class does,
+what business process it serves, and which subsystem it belongs to.
+
+#### `_store_draft(geid: str, draft: str) → None`
+
+Writes the micro_draft string to the Neo4j Component node:
+```cypher
+MATCH (c:Component {geid: $geid}) SET c.micro_draft = $draft
+```
+
+#### `_is_ollama_available() → bool`
+
+Calls `GET {ollama_base_url}/api/tags` to check if Ollama is running.
+Returns `False` on any exception — causes the stage to skip silently.
+
+### Graceful Degradation
+
+If `LOCAL_DRAFTING_ENABLED=false` or Ollama is not running, the entire stage is skipped.
+No errors are raised. The rest of the pipeline continues normally.
 
 ---
 
@@ -456,7 +598,7 @@ Extracts URL literal, strips query strings, normalises path variables, matches a
 | `EventClass` | `fqn` |
 | `DatabaseTable` | `name` |
 | `Configuration` | `config_key` |
-| `Specification` | `spec_id` (Sprint 2 prep) |
+| `Specification` | `spec_id` (Sprint 2/4) |
 
 ### Lookup Indexes
 
@@ -473,7 +615,7 @@ Extracts URL literal, strips query strings, normalises path variables, matches a
 | `logicunit_visibility` | Security analysis: filter by `public`/`private` |
 | `component_visibility` | Security analysis: filter by `public`/`private` |
 | `logicunit_lifecycle` | OSGi lifecycle queries |
-| `spec_rfc` | `Specification` nodes by RFC number (Sprint 2) |
+| `spec_rfc` | `Specification` nodes by RFC number (Sprint 4) |
 
 ### Fulltext Index
 
@@ -521,6 +663,26 @@ annotations=json.dumps(comp.annotations)   # e.g. '[{"name": "Component"}, {"nam
 | `load_queries_table_edges(edges)` | `QUERIES_TABLE` | |
 | `load_configuration_nodes(configs)` | `Configuration` nodes | |
 | `load_reads_config_edges(edges)` | `READS_CONFIG` | |
+| `load_resolves_to_edges(edges)` | `RESOLVES_TO` **(Sprint 2)** | OSGi component bindings |
+| `load_specification_nodes(specs)` | `Specification` nodes **(Sprint 4)** | RFC spec nodes from rfc_parser |
+| `load_implements_spec_edges(edges)` | `IMPLEMENTS_SPEC` **(Sprint 4)** | Java class → RFC specification |
+
+### Sprint 2: `load_resolves_to_edges`
+
+```python
+# APOC batch: MATCH iface:Component by fqn, MATCH impl:Component by fqn
+# MERGE (iface)-[r:RESOLVES_TO]->(impl) SET r.reference_field = $field_name
+```
+
+### Sprint 4: `load_specification_nodes` + `load_implements_spec_edges`
+
+```python
+# MERGE (s:Specification {rfc_number: $rfc_number})
+# SET s.title = $title, s.source_file = $source_file
+
+# MATCH (c:Component {fqn: $fqn}), MATCH (s:Specification {rfc_number: $rfc_number})
+# MERGE (c)-[r:IMPLEMENTS_SPEC]->(s) SET r.citation_context = $context
+```
 
 ### `load_annotated_with` (Updated)
 
@@ -538,6 +700,9 @@ ann_name = ann.get("name", "") if isinstance(ann, dict) else ann.lstrip("@").spl
 
 **Component** (added in v2 Sprint 1):
 - `visibility`, `is_abstract`, `is_final`
+
+**Component** (added in v2 Sprint 4):
+- `micro_draft` — 3-sentence Ollama-generated summary (on `:EntryPoint` nodes only)
 
 ---
 
@@ -582,28 +747,110 @@ high-fan-out utility edges (`THROWS`, `RETURNS`, `RECEIVES`, `INSTANTIATES`) tha
 
 ---
 
-## `graph/flow_extractor.py` — GDS Dijkstra Flow Extractor
+## `graph/flow_extractor.py` — GDS Dijkstra Flow Extractor (Sprint 3)
 
 ### Class: `FlowExtractor`
 
-#### `extract_all_flows() → list[FlowPath]`
+#### `extract_all_flows(max_pairs=200, max_path_length=15) → list[FlowPath]`
 
-1. Project execution-flow edges into GDS `nexus-flow-graph`
+1. Project execution-flow edges into GDS `nexus-flow-graph` with per-type weights
 2. Query all `:EntryPoint` and `:DataSink` nodes
 3. For each pair: `gds.shortestPath.dijkstra.stream` — O(E log V) per path
 4. Enrich paths with `READS_CONFIG` keys and `QUERIES_TABLE` table names
 5. Drop the GDS projection
+6. Return paths sorted by path_length
 
-### `FlowPath`
+#### Edge Weights (Sprint 3)
+
+```python
+_EDGE_WEIGHTS = {
+    "CALLS": 1.0,        # local method call — no cross-service penalty
+    "REMOTE_CALLS": 5.0, # cross-service REST call — penalised in pathfinding
+    "INJECTS": 1.0,
+    "IMPLEMENTS": 1.0,
+    "EXTENDS": 1.0,
+    "DEPENDS_ON": 1.0,
+    "HAS_METHOD": 1.0,
+    "DECLARES": 1.0,
+    "OVERRIDES": 1.0,
+    "QUERIES_TABLE": 1.0,
+    "READS_CONFIG": 1.0,
+    "RESOLVES_TO": 1.0,  # Sprint 2 OSGi edge
+}
+```
+
+#### GDS Projection with Weighted Relationships
+
+Each relationship type is projected with its default weight:
+```python
+f"{rel}: {{orientation: 'UNDIRECTED', "
+f"properties: {{weight: {{property: 'weight', defaultValue: {default_weight}}}}}}}"
+```
+
+The Dijkstra call uses:
+```cypher
+CALL gds.shortestPath.dijkstra.stream($graph_name, {
+    sourceNode: start,
+    targetNode: end,
+    relationshipWeightProperty: 'weight'
+})
+```
+
+#### `FlowPath`
 
 | Field | Description |
 |---|---|
-| `entry_fqn` | Starting API endpoint FQN |
-| `sink_fqn` | Terminal database/repository FQN |
+| `entry_point_fqn` | Starting API endpoint FQN |
+| `data_sink_fqn` | Terminal database/repository FQN |
 | `path_fqns` | Ordered list of FQNs along the path |
+| `path_node_details` | Full node data for each hop |
 | `config_keys` | Config keys read along the path |
 | `table_names` | Database tables accessed along the path |
-| `total_cost` | GDS Dijkstra path cost |
+| `path_length` | Number of nodes in the path |
+
+---
+
+## `pipeline/ingest.py` — Parallel Ingestion Engine (Sprint 1)
+
+**Purpose**: Parallelises Java file parsing and chunking across all CPU cores using `ProcessPoolExecutor`. Dramatically reduces wall-clock ingestion time for large Java monorepos.
+
+### `run_parallel_parse(java_files, repo_name, max_workers=None) → tuple[list[dict], list[dict], list[tuple]]`
+
+Main entry point for parallel parsing.
+
+**Parameters:**
+- `java_files`: List of `.java` file paths to parse
+- `repo_name`: Repository name for GEID generation
+- `max_workers`: CPU cores to use (defaults to `os.cpu_count()`)
+
+**Returns:**
+- `component_dicts`: List of serialized Component dicts
+- `chunk_dicts`: List of serialized EmbeddingChunk dicts
+- `errors`: List of `(file_path, error_message)` pairs
+
+**Algorithm:**
+1. Split files into batches of `_FILE_BATCH_SIZE = settings.parser_file_batch_size` files
+2. Submit batches to `ProcessPoolExecutor` — one batch per subprocess
+3. Collect results via `as_completed()` — progress logged every 5 completed batches
+4. Reassemble all component dicts, chunk dicts, and errors
+
+### `_parse_file_batch(args: tuple) → dict`
+
+Worker function running in a subprocess.
+
+**Key design notes:**
+- All imports (`JavaParser`, `UIRChunker`) happen **inside** the worker to avoid `spawn` mode issues on Windows
+- Returns only plain Python dicts — no custom objects (pickle-safe for cross-process transfer)
+- Catches `Exception` per file and appends to `errors` — one bad file does not kill the batch
+
+```python
+# Worker function signature
+def _parse_file_batch(args: tuple) -> dict:
+    file_paths, repo_name = args
+    from parsers.java_parser import JavaParser
+    from vectorstore.chunker import UIRChunker
+    # ... returns {"components": [...], "chunks": [...], "errors": [...]}
+```
 
 ---
 
@@ -625,14 +872,26 @@ high-fan-out utility edges (`THROWS`, `RETURNS`, `RECEIVES`, `INSTANTIATES`) tha
 #### `run(config_path, skip_summarization) → dict`
 
 Complete pipeline in order:
+
 1. `apply_schema()` — idempotent schema setup
 2. `mirror.mirror_all()` — Stage 1: clone/pull repos
-3. Per-repo loop: parse Java → load Neo4j nodes → embed ChromaDB
-4. Cross-repo link phase (Tier 1 → Tier 2 → Tier 3 edges)
-5. `gds.run_leiden()` — community detection
-6. `summarizer.summarize_all()` — LLM summaries (optional, uses fast model)
+3. Per-repo loop:
+   - `run_parallel_parse()` — **Sprint 1**: parallel CPU-bound parsing + chunking
+   - `loader.load_project()` — Neo4j node loading
+   - `embedder.upsert_chunks()` — ChromaDB vector loading
+4. Cross-repo link phase (Maven → REST API bridge → Type edges)
+5. **Sprint 2**: `osgi_parser.build_resolution_edges()` + `loader.load_resolves_to_edges()`
+6. `gds.run_leiden()` — community detection
+7. `summarizer.summarize_all()` — LLM summaries (optional, uses fast model)
+8. `tagger.tag_all()` — label `:EntryPoint` / `:DataSink`
+9. `flow_extractor.extract_all_flows()` — **Sprint 3**: weighted Dijkstra paths
+10. `flow_summarizer.summarize_all()` — flow narrative generation
+11. **Sprint 4**: `rfc_parser.parse_rfc_files()` + `loader.load_specification_nodes()`
+12. **Sprint 4**: `rfc_parser.detect_rfc_citations()` + `loader.load_implements_spec_edges()`
+13. **Sprint 4**: `local_drafting.run()` — Ollama micro-drafts for EntryPoints (if enabled)
+14. `global_rollup.run_full_rollup()` — L2/L3 GraphRAG rollup
 
-Returns stats dict: `{repos_mirrored, files_parsed, components, logic_units, call_edges, ...}`.
+Returns stats dict: `{repos_mirrored, files_parsed, components, logic_units, call_edges, osgi_edges, spec_nodes, impl_spec_edges, micro_drafts, ...}`.
 
 **Status tracking**: Writes current stage to Redis key `nexus:pipeline:stage`.
 
@@ -650,25 +909,52 @@ Defines `nexus ingest`, `nexus update`, `nexus validate`, `nexus stats`, `nexus 
 
 ---
 
-## `vectorstore/chunker.py` — UIR Chunker
+## `vectorstore/chunker.py` — AST-Aware Sliding Window Chunker (Sprint 1)
+
+**Purpose**: Produces one or more `EmbeddingChunk` objects per `LogicUnit`. Applies sliding window splitting for long methods and a context prefix on every chunk.
 
 ### `UIRChunker`
 
-#### `chunk_logic_unit(lu) → list[EmbeddingChunk]`
+#### `chunk_logic_unit(lu: LogicUnit) → list[EmbeddingChunk]`
 
-Returns 1–2 chunks per `LogicUnit`:
-- **`code_logic`**: method signature + raw body — captures *what the code does*
-- **`code_intent`**: parsed and formatted Javadoc — captures *what the developer intended*
+Returns 1–N chunks per `LogicUnit`:
+- **`code_logic`**: method signature + raw body, with `[Package: …] [Class: …]` prefix
+  - Short methods (≤ `CHUNK_SIZE` tokens): **1 chunk**, `chunk_id = "{geid}_code_logic"`
+  - Long methods (> `CHUNK_SIZE` tokens): **N chunks**, `chunk_id = "{geid}_code_logic_0"`, `"..._1"`, etc.
+- **`code_intent`**: parsed and formatted Javadoc — **always 1 chunk** (never windowed)
+  - `chunk_id = "{geid}_code_intent"`
+
+#### `_build_context_prefix(fqn: str) → str`
+
+Extracts package and class from FQN:
+```python
+# Input:  "org.wso2.identity.oauth2.AuthzEndpoint.handleTokenRequest(String)"
+# Output: "[Package: org.wso2.identity.oauth2] [Class: AuthzEndpoint] "
+```
+
+This prefix ensures that even when a chunk is retrieved in isolation from ChromaDB, the
+embedding carries the package and class context needed for accurate FQN resolution.
+
+#### `_sliding_window(text: str, chunk_size: int, overlap: int) → list[str]`
+
+Uses `tiktoken` `cl100k_base` encoder:
+```python
+tokens = encoder.encode(text)
+stride = chunk_size - overlap   # e.g. 512 - 128 = 384
+windows = [tokens[i:i+chunk_size] for i in range(0, len(tokens), stride)]
+return [encoder.decode(w) for w in windows if w]
+```
 
 ### `EmbeddingChunk`
 
 | Field | Description |
 |---|---|
-| `chunk_id` | `"{geid}_{chunk_type}"` — unique ChromaDB document ID |
+| `chunk_id` | `"{geid}_{chunk_type}"` or `"{geid}_{chunk_type}_{i}"` — unique ChromaDB document ID |
 | `geid` | GEID bridge to Neo4j node |
 | `fqn` | Fully qualified name |
-| `text` | Text to embed |
+| `text` | Text to embed (prefixed with `[Package: …] [Class: …]`) |
 | `chunk_type` | `"code_logic"` or `"code_intent"` |
+| `repo_name` | Repository name |
 
 ---
 
@@ -678,16 +964,39 @@ Returns 1–2 chunks per `LogicUnit`:
 
 | Collection | Embeds | Use Case |
 |---|---|---|
-| `code_logic` | Method body text | "Find code that does X" |
+| `code_logic` | Method body chunks (with context prefix) | "Find code that does X" |
 | `code_intent` | Javadoc description text | "Find code intended for X" |
 
-Both use `all-MiniLM-L6-v2` (384-dimensional, CPU-only, no API key).
+### Class: `ChromaEmbedder` (default)
+
+Uses `all-MiniLM-L6-v2` (384-dimensional, CPU-only, no API key).
 
 | Method | Description |
 |---|---|
 | `upsert_chunks(chunks)` | Batch upsert, splits by type, batches at `EMBEDDING_BATCH_SIZE` per call |
 | `semantic_search(query, collection, n_results)` | KNN similarity search |
 | `get_by_geid(geid, collection)` | Direct GEID lookup |
+
+### Class: `FastEmbedder` (Sprint 1 — optional GPU upgrade)
+
+Uses `fastembed` + ONNX Runtime with automatic CUDA detection.
+Model: `nomic-ai/nomic-embed-text-v1.5` (768-dimensional, significantly richer than MiniLM).
+
+**GPU detection:**
+```python
+import onnxruntime
+providers = onnxruntime.get_available_providers()
+use_gpu = "CUDAExecutionProvider" in providers
+# providers list passed to fastembed.TextEmbedding() for GPU acceleration
+```
+
+| Method | Description |
+|---|---|
+| `batch_embed(texts)` | Returns `list[list[float]]` — 768-dim vectors |
+| `embed_single(text)` | Single text → 768-dim vector |
+| `upsert_chunks_to_chroma(collection, chunks, batch_size=100)` | Batch upsert with FastEmbed vectors |
+
+**Activation:** Set `USE_FASTEMBED=true` in `.env`. Falls back to `ChromaEmbedder` if `fastembed` is not installed.
 
 ---
 

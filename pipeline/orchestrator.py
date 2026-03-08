@@ -21,6 +21,8 @@ from parsers.uir import Project, Module, Component, LogicUnit
 from parsers.geid import generate_geid
 from parsers.sql_schema_parser import SQLSchemaParser
 from parsers.config_parser import ConfigurationParser
+from parsers.osgi_parser import OSGiParser
+from parsers.rfc_parser import RFCParser
 from linker.maven_resolver import MavenResolver
 from linker.api_bridge import ApiBridgeDetector
 from graph.schema import apply_schema
@@ -65,6 +67,8 @@ class IngestionPipeline:
         self.api_bridge  = ApiBridgeDetector()
         self.sql_parser  = SQLSchemaParser()
         self.config_parser = ConfigurationParser()
+        self.osgi_parser = OSGiParser()
+        self.rfc_parser  = RFCParser()
         self.loader      = Neo4jLoader(self.neo4j_driver)
         self.gds         = GDSClient(self.neo4j_driver)
         self.tagger      = NodeTagger(self.neo4j_driver)
@@ -195,7 +199,7 @@ class IngestionPipeline:
                 all_chunks.extend(self.chunker.chunk_all(comp.logic_units, repo_name))
             self.embedder.upsert_chunks(all_chunks)
 
-            # ── Stage 2b: Scan SQL schemas + Config files (TASK 1) ────────────
+            # ── Stage 2b: Scan SQL schemas + Config files (Sprint 2) ─────────
             db_tables = self.sql_parser.scan_sql_scripts(repo_path, repo_name)
             if db_tables:
                 self.loader.load_database_tables(db_tables)
@@ -215,6 +219,36 @@ class IngestionPipeline:
                 )
                 self.loader.load_reads_config_edges(config_edges)
                 stats["config_entries"] += len(config_entries)
+
+        # ── Sprint 2: OSGi resolution (cross-repo, all components known) ─────
+        if settings.osgi_enabled:
+            self._set_status("stage", "osgi")
+            osgi_components = self.osgi_parser.parse_components(
+                all_java_files, all_components,
+            )
+            osgi_edges = self.osgi_parser.build_resolution_edges(
+                all_java_files, all_components, osgi_components,
+            )
+            if osgi_edges:
+                self.loader.load_resolves_to_edges(osgi_edges)
+            logger.info(
+                "OSGi: %d @Component declarations, %d RESOLVES_TO edges",
+                len(osgi_components), len(osgi_edges),
+            )
+
+        # ── Sprint 4: RFC specification grounding ─────────────────────────────
+        rfc_specs = self.rfc_parser.parse_rfc_files(settings.rfc_path)
+        if rfc_specs:
+            self.loader.load_specification_nodes(rfc_specs)
+            rfc_edges = self.rfc_parser.detect_rfc_citations(
+                all_java_files, all_components,
+            )
+            if rfc_edges:
+                self.loader.load_implements_spec_edges(rfc_edges)
+            logger.info(
+                "RFCs: %d specifications, %d IMPLEMENTS_SPEC edges",
+                len(rfc_specs), len(rfc_edges) if rfc_specs else 0,
+            )
 
         # ── Stage 3: Link (cross-repo, all nodes loaded first) ───────────────
         self._set_status("stage", "link")
@@ -335,7 +369,20 @@ class IngestionPipeline:
         else:
             logger.info("Skipping flow extraction — no EntryPoints or DataSinks tagged")
 
-        # ── Post: Global GraphRAG Rollup (TASK 5) ────────────────────────────
+        # ── Post: Local Ollama micro-drafts for EntryPoint classes (Sprint 4) ─
+        if settings.local_drafting_enabled and not skip_summarization:
+            self._set_status("stage", "local_drafting")
+            try:
+                from llm.local_drafting import LocalDraftingEngine
+                drafting_engine = LocalDraftingEngine(self.neo4j_driver)
+                n_drafts = drafting_engine.run(
+                    max_workers=min(2, settings.summarizer_max_workers),
+                )
+                logger.info("Local micro-drafts generated: %d", n_drafts)
+            except Exception as e:
+                logger.warning("Local drafting failed (non-fatal): %s", e)
+
+        # ── Post: Global GraphRAG Rollup (Sprint 4) ───────────────────────────
         if not skip_summarization and settings.community_summarization_enabled:
             self._set_status("stage", "global_rollup")
             try:

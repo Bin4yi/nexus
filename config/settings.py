@@ -147,6 +147,16 @@ class Settings(BaseSettings):
         description="Number of Java files parsed before flushing to Neo4j/ChromaDB.",
     )
 
+    # ── Chunking (Sprint 1 — AST-aware sliding window) ────────────────────────
+    chunk_size: int = Field(
+        default=512,
+        description="Max tokens per AST-aware sliding window chunk.",
+    )
+    chunk_overlap: int = Field(
+        default=128,
+        description="Token overlap between consecutive sliding window chunks.",
+    )
+
     # ── Embeddings ────────────────────────────────────────────────────────────
     embedding_model: str = Field(
         default="all-MiniLM-L6-v2",
@@ -155,6 +165,42 @@ class Settings(BaseSettings):
     embedding_batch_size: int = Field(
         default=100,
         description="ChromaDB upsert batch size.",
+    )
+
+    # ── FastEmbed (Sprint 1 — GPU-accelerated Nomic embeddings) ───────────────
+    use_fastembed: bool = Field(
+        default=False,
+        description="Use fastembed (nomic-ai model) instead of sentence-transformers.",
+    )
+    fastembed_model: str = Field(
+        default="nomic-ai/nomic-embed-text-v1.5",
+        description="FastEmbed model name for GPU-accelerated embeddings.",
+    )
+
+    # ── OSGi (Sprint 2) ───────────────────────────────────────────────────────
+    osgi_enabled: bool = Field(
+        default=True,
+        description="Enable OSGi @Component/@Reference annotation parsing.",
+    )
+
+    # ── RFC / Specification Grounding (Sprint 4) ──────────────────────────────
+    rfc_path: Path = Field(
+        default=Path("./rfcs"),
+        description="Path to IETF RFC markdown files for specification grounding.",
+    )
+
+    # ── Ollama / Local LLM (Sprint 4) ─────────────────────────────────────────
+    ollama_base_url: str = Field(
+        default="http://localhost:11434",
+        description="Ollama API base URL for local LLM inference (micro-drafts).",
+    )
+    ollama_model: str = Field(
+        default="llama3.2:3b",
+        description="Ollama model for EntryPoint micro-draft generation.",
+    )
+    local_drafting_enabled: bool = Field(
+        default=False,
+        description="Enable Ollama-powered micro-draft generation for EntryPoint classes.",
     )
 
     # ── Resilience ────────────────────────────────────────────────────────────

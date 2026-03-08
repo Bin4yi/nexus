@@ -21,6 +21,14 @@ chromadb>=0.4.0,<0.6.0
 # ── Embeddings ───────────────────────────────────────────────────────────────
 sentence-transformers>=2.0
 
+# ── FastEmbed + ONNX Runtime (Sprint 1 — GPU-accelerated Nomic embeddings) ───
+# CPU-only (default):
+#   pip install fastembed onnxruntime
+# GPU (CUDA 11.x or 12.x):
+#   pip install fastembed-gpu onnxruntime-gpu
+# Uncomment the line below to add fastembed as a hard dependency:
+# fastembed>=0.3.0
+
 # ── Cache / state ────────────────────────────────────────────────────────────
 redis>=4.0,<6.0
 

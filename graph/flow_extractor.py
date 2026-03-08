@@ -40,8 +40,25 @@ _flow_retry = retry(
 _FLOW_RELATIONSHIPS = [
     "CALLS", "INJECTS", "IMPLEMENTS", "EXTENDS",
     "DEPENDS_ON", "HAS_METHOD", "DECLARES", "REMOTE_CALLS",
-    "OVERRIDES", "QUERIES_TABLE", "READS_CONFIG",
+    "OVERRIDES", "QUERIES_TABLE", "READS_CONFIG", "RESOLVES_TO",
 ]
+
+# Sprint 3: Edge weights — CALLS = 1 (local), REMOTE_CALLS = 5 (cross-service penalty)
+# All other edges default to weight 1.0.
+_EDGE_WEIGHTS: dict[str, float] = {
+    "CALLS": 1.0,
+    "REMOTE_CALLS": 5.0,
+    "INJECTS": 1.0,
+    "IMPLEMENTS": 1.0,
+    "EXTENDS": 1.0,
+    "DEPENDS_ON": 1.0,
+    "HAS_METHOD": 1.0,
+    "DECLARES": 1.0,
+    "OVERRIDES": 1.0,
+    "QUERIES_TABLE": 1.0,
+    "READS_CONFIG": 1.0,
+    "RESOLVES_TO": 1.0,
+}
 
 # Node labels in the flow graph
 _FLOW_NODE_LABELS = [
@@ -179,9 +196,18 @@ class FlowExtractor:
             logger.warning("No flow node labels found in DB")
             return
 
-        rel_map = ", ".join(
-            f"{rel}: {{orientation: 'UNDIRECTED'}}" for rel in projected_rels
-        )
+        # Sprint 3: Build relationship projection with per-type default weights.
+        # Weight property "weight" is used if present on the relationship,
+        # otherwise the defaultValue from _EDGE_WEIGHTS is applied.
+        # This gives REMOTE_CALLS (cross-service) a penalty of 5 vs CALLS=1.
+        rel_entries = []
+        for rel in projected_rels:
+            default_weight = _EDGE_WEIGHTS.get(rel, 1.0)
+            rel_entries.append(
+                f"{rel}: {{orientation: 'UNDIRECTED', "
+                f"properties: {{weight: {{property: 'weight', defaultValue: {default_weight}}}}}}}"
+            )
+        rel_map = ", ".join(rel_entries)
         label_list = str(projected_labels)
 
         with self.driver.session() as session:
@@ -276,7 +302,8 @@ class FlowExtractor:
                     MATCH (end) WHERE id(end) = $end_id
                     CALL gds.shortestPath.dijkstra.stream($graph_name, {
                         sourceNode: start,
-                        targetNode: end
+                        targetNode: end,
+                        relationshipWeightProperty: 'weight'
                     })
                     YIELD index, sourceNode, targetNode, totalCost, nodeIds, costs, path
                     RETURN nodeIds, totalCost

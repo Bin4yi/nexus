@@ -512,6 +512,93 @@ class Neo4jLoader:
                 ).consume()
         logger.info("Loaded %d READS_CONFIG edges", len(edges))
 
+    def load_resolves_to_edges(self, edges: list) -> None:
+        """
+        Create [:RESOLVES_TO] edges from Interface Component → Implementation Component.
+        (Sprint 2: OSGi runtime injection resolution)
+
+        ``edges`` should be a list of ``OSGiResolutionEdge`` objects.
+        """
+        if not edges:
+            return
+
+        pairs = [
+            {
+                "interface_fqn": e.interface_fqn,
+                "implementation_fqn": e.implementation_fqn,
+                "reference_field": e.reference_field,
+            }
+            for e in edges
+        ]
+
+        with self.driver.session() as session:
+            session.run(
+                """
+                CALL apoc.periodic.iterate(
+                    'UNWIND $pairs AS pair RETURN pair',
+                    'MATCH (iface:Component)
+                       WHERE iface.fqn = pair.interface_fqn
+                          OR iface.fqn ENDS WITH pair.interface_fqn
+                     MATCH (impl:Component)
+                       WHERE impl.fqn = pair.implementation_fqn
+                          OR impl.fqn ENDS WITH pair.implementation_fqn
+                     MERGE (iface)-[r:RESOLVES_TO]->(impl)
+                     SET r.reference_field = pair.reference_field',
+                    {batchSize: $batch_size, params: {pairs: $pairs}}
+                )
+                """,
+                pairs=pairs,
+                batch_size=settings.batch_size,
+            ).consume()
+        logger.info("Loaded %d OSGi [:RESOLVES_TO] edges", len(edges))
+
+    def load_specification_nodes(self, specs: list) -> None:
+        """
+        Create (:Specification) nodes for IETF RFCs.
+        (Sprint 4: specification grounding)
+
+        ``specs`` should be a list of ``SpecificationInfo`` objects.
+        """
+        if not specs:
+            return
+        with self.driver.session() as session:
+            for spec in specs:
+                session.run(
+                    """
+                    MERGE (s:Specification {rfc_number: $rfc_number})
+                    SET s.title = $title,
+                        s.source_file = $source_file
+                    """,
+                    rfc_number=spec.rfc_number,
+                    title=spec.title,
+                    source_file=spec.source_file,
+                ).consume()
+        logger.info("Loaded %d Specification nodes", len(specs))
+
+    def load_implements_spec_edges(self, edges: list) -> None:
+        """
+        Create [:IMPLEMENTS_SPEC] edges from Component → Specification.
+        (Sprint 4: specification grounding)
+
+        ``edges`` should be a list of ``SpecImplementsEdge`` objects.
+        """
+        if not edges:
+            return
+        with self.driver.session() as session:
+            for edge in edges:
+                session.run(
+                    """
+                    MATCH (c:Component {geid: $geid})
+                    MATCH (s:Specification {rfc_number: $rfc_number})
+                    MERGE (c)-[r:IMPLEMENTS_SPEC]->(s)
+                    SET r.citation_context = $citation_context
+                    """,
+                    geid=edge.component_geid,
+                    rfc_number=edge.rfc_number,
+                    citation_context=edge.citation_context,
+                ).consume()
+        logger.info("Loaded %d [:IMPLEMENTS_SPEC] edges", len(edges))
+
     def load_remote_calls(self, edges: list[dict[str, Any]]) -> None:
         """Create [:REMOTE_CALLS] edges from API bridge detection results."""
         if not edges:

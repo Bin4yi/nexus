@@ -1,9 +1,14 @@
 """
 vectorstore/embedder.py
-ChromaDB embedder — stores code_logic and code_intent chunks
-using HuggingFace sentence embeddings.
+ChromaDB embedder — stores code_logic and code_intent chunks.
 
-Embedding model and upsert batch size are read from ``config.settings``.
+Sprint 1 upgrade: adds ``FastEmbedder`` which uses ``fastembed`` with
+dynamic ONNX runtime provider selection (CUDAExecutionProvider when a
+CUDA-capable GPU is present, CPUExecutionProvider otherwise).
+
+The existing ``ChromaEmbedder`` (sentence-transformers) is retained for
+environments without fastembed installed.  Set ``USE_FASTEMBED=true`` in
+``.env`` to switch to the Nomic model.
 
 chromadb is imported lazily inside __init__ to avoid the pydantic-v1 shim
 crash on Python 3.14.
@@ -146,7 +151,7 @@ class ChromaEmbedder:
             batch = list(seen.values())
             self._upsert_with_retry(collection, batch)
 
-    def _upsert_with_retry(
+    def _upsert_with_retry(  # noqa: C901
         self, collection, batch: list[EmbeddingChunk], _attempt: int = 0
     ) -> None:
         """Upsert a single batch, splitting in half on connection errors."""
@@ -191,3 +196,127 @@ class ChromaEmbedder:
                 self._upsert_with_retry(collection, batch[half:], _attempt + 1)
             else:
                 raise
+
+
+# ── Sprint 1: GPU-accelerated FastEmbed embedder ──────────────────────────────
+
+class FastEmbedder:
+    """
+    GPU-accelerated batch embedder using ``fastembed`` + ONNX Runtime.
+
+    Dynamically selects ``CUDAExecutionProvider`` if available; otherwise
+    falls back to ``CPUExecutionProvider``.  Uses the ``nomic-ai/nomic-embed-text-v1.5``
+    model (768-dim, significantly stronger than MiniLM for code).
+
+    Usage:
+        embedder = FastEmbedder()
+        vectors = embedder.batch_embed(["def foo(): ...", "class Bar: ..."])
+    """
+
+    def __init__(self):
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            raise ImportError(
+                "onnxruntime is required for FastEmbedder. "
+                "Install with: pip install onnxruntime  (CPU) or "
+                "pip install onnxruntime-gpu  (CUDA)"
+            )
+        try:
+            from fastembed import TextEmbedding
+        except ImportError:
+            raise ImportError(
+                "fastembed is required for FastEmbedder. "
+                "Install with: pip install fastembed  (CPU) or "
+                "pip install fastembed-gpu  (CUDA)"
+            )
+
+        available = ort.get_available_providers()
+        use_gpu = "CUDAExecutionProvider" in available
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if use_gpu
+            else ["CPUExecutionProvider"]
+        )
+
+        logger.info(
+            "FastEmbedder: ONNX providers=%s  model=%s",
+            providers, settings.fastembed_model,
+        )
+
+        self._model = TextEmbedding(
+            model_name=settings.fastembed_model,
+            providers=providers,
+        )
+        self._use_gpu = use_gpu
+
+    @property
+    def uses_gpu(self) -> bool:
+        return self._use_gpu
+
+    def batch_embed(self, texts: list[str]) -> list[list[float]]:
+        """
+        Embed a batch of texts and return their vectors.
+
+        Args:
+            texts: List of plain-text strings to embed.
+
+        Returns:
+            List of float vectors (one per input text).
+        """
+        if not texts:
+            return []
+        return [vec.tolist() for vec in self._model.embed(texts)]
+
+    def embed_single(self, text: str) -> list[float]:
+        """Convenience wrapper for a single text."""
+        return self.batch_embed([text])[0]
+
+    def upsert_chunks_to_chroma(
+        self,
+        collection,
+        chunks: list[EmbeddingChunk],
+        batch_size: int = 100,
+    ) -> None:
+        """
+        Embed chunks with fastembed and upsert pre-computed vectors to ChromaDB.
+
+        ChromaDB accepts pre-computed ``embeddings=`` so the collection must be
+        created WITHOUT an embedding function (pass ``embedding_function=None``
+        or use ``get_or_create_collection`` without specifying one).
+
+        Args:
+            collection: ChromaDB collection created without an embedding function.
+            chunks:     EmbeddingChunk objects to upsert.
+            batch_size: Number of chunks per batch.
+        """
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i: i + batch_size]
+            # Deduplicate
+            seen: dict[str, EmbeddingChunk] = {}
+            for c in batch:
+                seen[c.chunk_id] = c
+            batch = list(seen.values())
+
+            texts = [c.text for c in batch]
+            vectors = self.batch_embed(texts)
+
+            collection.upsert(
+                ids=[c.chunk_id for c in batch],
+                embeddings=vectors,
+                documents=texts,
+                metadatas=[
+                    {
+                        "geid": c.geid,
+                        "fqn": c.fqn,
+                        "chunk_type": c.chunk_type,
+                        "language": c.language,
+                        "file_path": c.file_path,
+                        "start_line": c.start_line,
+                        "end_line": c.end_line,
+                        "repo_name": c.repo_name,
+                    }
+                    for c in batch
+                ],
+            )
+        logger.info("FastEmbedder: upserted %d chunks to ChromaDB", len(chunks))

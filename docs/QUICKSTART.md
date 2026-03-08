@@ -55,7 +55,7 @@ Open `.env` and set:
 LLM_API_KEY=sk-...
 
 # Model tiers (defaults are fine)
-LLM_FAST_MODEL=gpt-4o-mini      # bulk ops: summarisation, scoring
+LLM_FAST_MODEL=gpt-4o-mini      # bulk ops: summarisation, flow narratives, scoring
 LLM_STRONG_MODEL=gpt-4o         # final answers, global rollup
 
 # Repos to ingest (points to sample_repos/repos.yaml by default)
@@ -97,14 +97,19 @@ py -m pip install -r requirements.txt
 py main.py ingest
 ```
 
-The pipeline runs five stages automatically:
+The pipeline runs these stages automatically:
 
 ```
-1. Mirror    — git clone / git pull all repos into ./mirror/
-2. Extract   — Tree-sitter AST → UIR objects (methods, classes, annotations)
-3. Link      — Maven dependencies + REST API bridge + JAX-RS path composition
-4. Load      — MERGE nodes into Neo4j, embed method bodies into ChromaDB
-5. Post      — Leiden communities → LLM summaries → flow extraction → global rollup
+1. Mirror        — git clone / git pull all repos into ./mirror/
+2. Parallel Parse — ProcessPoolExecutor: Tree-sitter AST across all CPU cores
+                   AST-aware sliding window chunking (512 tokens, 128 overlap)
+                   Context prefix [Package: …] [Class: …] on every chunk
+3. Link          — Maven dependencies + REST API bridge + JAX-RS path composition
+4. OSGi          — @Component/@Reference → [:RESOLVES_TO] edges (Sprint 2)
+5. Load          — MERGE nodes into Neo4j, embed method chunks into ChromaDB
+6. RFC           — RFC markdown files → (:Specification) nodes + [:IMPLEMENTS_SPEC] edges (Sprint 4)
+7. Micro-Drafts  — Ollama local LLM → micro_draft property on EntryPoints (Sprint 4, optional)
+8. Post          — Leiden communities → LLM summaries → weighted Dijkstra flows → global rollup
 ```
 
 Ingestion time for reference:
@@ -136,8 +141,7 @@ py main.py interactive
 ```
 ╔══════════════════════════════════════════════════════════════════╗
 ║          CodeNexus — Interactive Query Mode                      ║
-║  Type a question and press Enter.  'exit' or Ctrl+C to quit.    ║
-╚══════════════════════════════════════════════════════════════════╝
+║  Type a question and press Enter.  'exit' or Ctrl+C to quit.    ╚══════════════════════════════════════════════════════════════════╝
 
   nexus> how does the OAuth token exchange flow work?
   nexus> which classes implement the TokenValidator interface?
@@ -216,6 +220,84 @@ No code changes needed — the `make_llm_client(tier)` factory handles the switc
 
 ---
 
+## GPU-accelerated embeddings (optional — Sprint 1)
+
+For large repos (50,000+ Java methods), GPU-accelerated embeddings using
+`nomic-ai/nomic-embed-text-v1.5` (768-dimensional) can reduce embedding time by 5–10×.
+
+**Requirements:** NVIDIA GPU with CUDA 11.x or 12.x, `nvcc --version` must work.
+
+```bash
+# Install GPU-capable packages
+pip install fastembed-gpu onnxruntime-gpu
+
+# Enable in .env
+USE_FASTEMBED=true
+FASTEMBED_MODEL=nomic-ai/nomic-embed-text-v1.5
+```
+
+CodeNexus automatically detects CUDA via `onnxruntime.get_available_providers()` and
+falls back to CPU if the GPU is not available.
+
+**CPU-only Nomic (still richer than MiniLM):**
+```bash
+pip install fastembed onnxruntime
+USE_FASTEMBED=true
+```
+
+---
+
+## Ollama local micro-drafts (optional — Sprint 4)
+
+Generate 3-sentence summaries of every API endpoint class at **zero API cost**
+using a local LLM (Llama 3.2). Summaries are stored as `micro_draft` on Neo4j Component nodes.
+
+**Setup:**
+```bash
+# 1. Install Ollama from https://ollama.com/
+# 2. Pull and start the model:
+ollama run llama3.2
+
+# 3. Enable in .env:
+LOCAL_DRAFTING_ENABLED=true
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2:3b
+```
+
+If Ollama is not running when `py main.py ingest` runs, this stage is silently skipped
+with no errors.
+
+---
+
+## RFC Specification Grounding (optional — Sprint 4)
+
+Cross-reference Java source against IETF RFC specifications.
+
+```bash
+# 1. Create the rfcs/ directory
+mkdir rfcs
+
+# 2. Place RFC markdown/text files there, e.g.:
+#    rfcs/rfc6749-oauth2.md
+#    rfcs/rfc7519-jwt.md
+#    rfcs/rfc8693-token-exchange.md
+
+# 3. In .env (default is ./rfcs):
+RFC_PATH=./rfcs
+
+# 4. Re-run ingest
+py main.py ingest
+```
+
+After ingest, you can query RFC grounding in Neo4j:
+```cypher
+MATCH (c:Component)-[r:IMPLEMENTS_SPEC]->(s:Specification)
+RETURN c.fqn, s.rfc_number, s.title
+ORDER BY s.rfc_number
+```
+
+---
+
 ## Key ports and UIs
 
 | Service | URL | Credentials |
@@ -244,6 +326,10 @@ docker compose down -v       # stop and DELETE all data (full reset)
 | Ingestion stuck at summarisation | Increase `SUMMARIZER_MAX_WORKERS` or check OpenAI rate limits |
 | Empty query results | Check Neo4j has nodes: run `MATCH (n) RETURN count(n)` in the browser |
 | `tomllib` not found | Requires Python 3.11+. Run `py --version` to confirm |
+| `fastembed` import error | Run `pip install fastembed onnxruntime` (CPU) or `pip install fastembed-gpu onnxruntime-gpu` (GPU) |
+| Ollama stage skipped silently | Check Ollama is running: `curl http://localhost:11434/api/tags` |
+| OSGi edges not appearing | Check `OSGI_ENABLED=true` in `.env`; verify Java sources contain `@Component`/`@Reference` |
+| RFC nodes not created | Check `RFC_PATH` points to a directory with `.md` or `.txt` files |
 
 ---
 
@@ -252,7 +338,11 @@ docker compose down -v       # stop and DELETE all data (full reset)
 | Task | Command / file |
 |---|---|
 | Add more repos | Edit `sample_repos/repos.yaml`, re-run `py main.py ingest` |
+| Enable GPU embeddings | `pip install fastembed-gpu onnxruntime-gpu`, set `USE_FASTEMBED=true` |
+| Enable Ollama micro-drafts | Install Ollama, set `LOCAL_DRAFTING_ENABLED=true` |
+| Add RFC specifications | Place RFC files in `./rfcs/`, re-run ingest |
 | Tune query depth | `py main.py query "..." --depth 5` |
 | Scope to one repo | `py main.py interactive --repo carbon-identity-framework` |
 | Read full architecture | `docs/ARCHITECTURE.md` |
 | Read all CLI options | `docs/CODE_REFERENCE.md` |
+| See what changed in v2 | `docs/V2_CHANGELOG.md` |
