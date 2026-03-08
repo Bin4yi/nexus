@@ -149,6 +149,17 @@ class JavaParser:
         implements = self._extract_implements(node, source, imports)
         annotations = self._extract_annotations(node, source)
 
+        # Extract component visibility and modifiers
+        comp_visibility = "public"
+        comp_is_abstract = False
+        comp_is_final = False
+        comp_modifiers = node.child_by_field_name("modifiers")
+        if comp_modifiers:
+            mod_text = source[comp_modifiers.start_byte:comp_modifiers.end_byte].decode("utf-8")
+            comp_visibility = next((m for m in ["public", "protected", "private"] if m in mod_text), "package")
+            comp_is_abstract = "abstract" in mod_text
+            comp_is_final = "final" in mod_text
+
         # Determine if this is a WSO2/Spring event handler
         is_event_handler = self._is_event_handler(extends, implements)
 
@@ -184,6 +195,9 @@ class JavaParser:
             file_path=file_path,
             start_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
+            visibility=comp_visibility,
+            is_abstract=comp_is_abstract,
+            is_final=comp_is_final,
         )
 
     # ── Method / Constructor ──────────────────────────────────────────────────
@@ -217,9 +231,33 @@ class JavaParser:
         throws = self._extract_throws(node, source, imports)
         instantiates = self._extract_instantiations(node, source, imports)
 
+        # Extract visibility and modifiers
+        visibility = "package"
+        is_static = False
+        is_abstract = False
+        is_final = False
+        is_synchronized = False
+        modifiers_node = node.child_by_field_name("modifiers")
+        if modifiers_node:
+            mod_text = source[modifiers_node.start_byte:modifiers_node.end_byte].decode("utf-8")
+            visibility = next((m for m in ["public", "protected", "private"] if m in mod_text), "package")
+            is_static = "static" in mod_text
+            is_abstract = "abstract" in mod_text
+            is_final = "final" in mod_text
+            is_synchronized = "synchronized" in mod_text
+
+        # Detect OSGi lifecycle role from annotations
+        _OSGI_LIFECYCLE = {"Activate": "activate", "Deactivate": "deactivate", "Modified": "modified"}
+        lifecycle_role: Optional[str] = None
+        for ann in annotations:
+            ann_name = ann.get("name", "")
+            if ann_name in _OSGI_LIFECYCLE:
+                lifecycle_role = _OSGI_LIFECYCLE[ann_name]
+                break
+
         # Detect @Override → resolve overrides FQN from parent
         overrides: Optional[str] = None
-        if any("@Override" in a for a in annotations) and parent_extends:
+        if any(a.get("name") == "Override" for a in annotations) and parent_extends:
             parent_simple = parent_extends.rsplit(".", 1)[-1]
             overrides = f"{parent_extends}.{name}" if "." in parent_extends else f"{parent_simple}.{name}"
 
@@ -257,6 +295,12 @@ class JavaParser:
             file_path=file_path,
             start_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
+            visibility=visibility,
+            is_static=is_static,
+            is_abstract=is_abstract,
+            is_final=is_final,
+            is_synchronized=is_synchronized,
+            lifecycle_role=lifecycle_role,
         )
 
     # ── Field extraction ──────────────────────────────────────────────────────
@@ -277,8 +321,13 @@ class JavaParser:
                         "floating_point_type", "boolean_type",
                     ):
                         raw = source[c.start_byte:c.end_byte].decode("utf-8")
-                        simple = raw.split("<")[0].strip()  # strip generics
-                        type_name = imports.get(simple, raw)
+                        simple = raw.split("<")[0].strip()
+                        base_fqn = imports.get(simple, simple)
+                        # Preserve generic parameters: List<User> → java.util.List<User>
+                        if "<" in raw:
+                            type_name = base_fqn + raw[len(simple):]
+                        else:
+                            type_name = imports.get(simple, raw)
                         break
 
                 # Collect variable names (may declare multiple: int a, b;)
@@ -353,6 +402,7 @@ class JavaParser:
             if child.type in ("formal_parameter", "spread_parameter"):
                 name = None
                 type_name = None
+                param_annotations: list[dict] = []
                 for c in child.children:
                     if c.type == "identifier":
                         name = source[c.start_byte:c.end_byte].decode("utf-8")
@@ -362,8 +412,12 @@ class JavaParser:
                         "scoped_type_identifier",
                     ):
                         type_name = source[c.start_byte:c.end_byte].decode("utf-8")
+                    elif c.type in ("marker_annotation", "annotation"):
+                        ann = self._parse_annotation(c, source)
+                        if ann:
+                            param_annotations.append(ann)
                 if name and type_name:
-                    params.append(Parameter(name=name, type_name=type_name))
+                    params.append(Parameter(name=name, type_name=type_name, annotations=param_annotations))
         return params
 
     def _extract_return_type(self, node: Node, source: bytes) -> Optional[str]:
@@ -409,13 +463,54 @@ class JavaParser:
         for child in node.children:
             self._walk_calls(child, source, imports, acc)
 
-    def _extract_annotations(self, node: Node, source: bytes) -> list[str]:
+    def _parse_annotation(self, node: Node, source: bytes) -> dict:
+        """Parse an annotation node into a structured dict."""
+        name_node = node.child_by_field_name("name")
+        if name_node:
+            name = source[name_node.start_byte:name_node.end_byte].decode("utf-8")
+        else:
+            name = self._get_identifier(node, source)
+        if not name:
+            return {}
+
+        result: dict = {"name": name}
+
+        args_node = node.child_by_field_name("arguments")
+        if args_node:
+            raw_args = source[args_node.start_byte:args_node.end_byte].decode("utf-8", errors="replace").strip()
+            if raw_args.startswith("("):
+                raw_args = raw_args[1:]
+            if raw_args.endswith(")"):
+                raw_args = raw_args[:-1]
+            raw_args = raw_args.strip()
+            if raw_args:
+                # Single string: @Value("${key}") or @Path("/api/v2")
+                m = re.match(r'^["\']([^"\']+)["\']$', raw_args)
+                if m:
+                    result["value"] = m.group(1)
+                else:
+                    # Named key=value pairs: @Reference(cardinality = MANDATORY)
+                    attrs: dict = {}
+                    for pair_m in re.finditer(
+                        r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([A-Za-z0-9_.]+))',
+                        raw_args,
+                    ):
+                        attr_name = pair_m.group(1)
+                        attr_value = pair_m.group(2) or pair_m.group(3) or pair_m.group(4) or ""
+                        attrs[attr_name] = attr_value
+                    if attrs:
+                        result.update(attrs)
+                    elif raw_args:
+                        result["value"] = raw_args[:200]
+        return result
+
+    def _extract_annotations(self, node: Node, source: bytes) -> list[dict]:
         annotations = []
         for child in node.children:
             if child.type in ("marker_annotation", "annotation"):
-                annotations.append(
-                    source[child.start_byte:child.end_byte].decode("utf-8")
-                )
+                ann = self._parse_annotation(child, source)
+                if ann:
+                    annotations.append(ann)
         return annotations
 
     def _extract_preceding_javadoc(self, node: Node, source: bytes) -> str:

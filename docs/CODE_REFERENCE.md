@@ -1,53 +1,73 @@
 # CodeNexus — Code Reference
 
-Per-file documentation for all source modules. Organized by layer (bottom-up, from data models to entry point).
+Per-file documentation for all source modules. Organized bottom-up from data models to entry point.
 
 ---
 
 ## `main.py` — CLI Entry Point
 
-**Purpose**: The single entry point for all CodeNexus operations.
+**Purpose**: Single entry point for all CodeNexus operations.
 
 ### Commands
 ```bash
-python main.py ingest   # Run the full ingestion pipeline
+py main.py ingest         # Run the full ingestion pipeline
+py main.py query "..."    # Ask a question (three-tier router)
+py main.py explain <name> # Explain a method or class
+py main.py trace <name>   # Show call chain (no LLM)
+py main.py callers <name> # List all callers
+py main.py find <text>    # Exact text search (no LLM)
+py main.py debug <error>  # Root-cause analysis
 ```
 
 ### Functions
 | Function | Description |
 |---|---|
-| `ingest()` | Instantiates `IngestionPipeline`, calls `.run()`, logs all stats. Exits with code 1 if any repos failed. |
-| `main()` | `argparse` router — parses the subcommand and dispatches to the appropriate function. |
+| `ingest()` | Instantiates `IngestionPipeline`, calls `.run()`, logs stats. Exits with code 1 if any repos failed. |
+| `main()` | `argparse` router — parses subcommand, dispatches to appropriate function. |
 
 ---
 
 ## `config/settings.py` — Central Configuration
 
-**Purpose**: Loads all environment variables from `.env` into a typed `Settings` Pydantic model. All modules import `settings` from here — nothing else reads `.env` directly.
+**Purpose**: Loads all environment variables from `.env` into a typed `Settings` Pydantic model. All modules import the singleton `settings` from here.
 
 ### Key Settings
+
 | Setting | Env Var | Default | Description |
 |---|---|---|---|
 | `neo4j_uri` | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection |
-| `neo4j_auth` | `NEO4J_USER` + `NEO4J_PASSWORD` | — | Returns `(user, pass)` tuple |
+| `neo4j_user` | `NEO4J_USER` | `neo4j` | Auth username |
+| `neo4j_password` | `NEO4J_PASSWORD` | `nexuspassword` | Auth password |
 | `chroma_host` | `CHROMA_HOST` | `localhost` | ChromaDB host |
 | `chroma_port` | `CHROMA_PORT` | `8000` | ChromaDB port |
-| `llm_provider` | `LLM_PROVIDER` | `openai` | `openai` or `azure` — selects client type in `make_llm_client()` |
-| `llm_api_key` | `LLM_API_KEY` | — | API key for OpenAI or Azure OpenAI |
-| `llm_model` | `LLM_MODEL` | `gpt-5` | Model for all LLM calls |
-| `llm_azure_endpoint` | `LLM_AZURE_ENDPOINT` | `""` | Azure OpenAI endpoint URL |
+| `redis_url` | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
+| `llm_provider` | `LLM_PROVIDER` | `openai` | `openai` or `azure` |
+| `llm_api_key` | `LLM_API_KEY` | `""` | API key |
+| `llm_fast_model` | `LLM_FAST_MODEL` | `gpt-4o-mini` | Bulk ops model |
+| `llm_strong_model` | `LLM_STRONG_MODEL` | `gpt-4o` | Final answer model |
+| `llm_azure_endpoint` | `LLM_AZURE_ENDPOINT` | `""` | Azure endpoint URL |
 | `llm_azure_api_version` | `LLM_AZURE_API_VERSION` | `2025-04-01-preview` | Azure API version |
-| `llm_deployment` | `LLM_DEPLOYMENT` | `""` | Azure deployment name (usually same as model) |
+| `llm_deployment` | `LLM_DEPLOYMENT` | `""` | Azure deployment name |
+| `max_context_tokens` | `MAX_CONTEXT_TOKENS` | `8000` | Token budget ceiling |
 | `gds_graph_name` | `GDS_GRAPH_NAME` | `codenexus-graph` | GDS in-memory graph name |
-| `max_context_tokens` | `MAX_CONTEXT_TOKENS` | `32000` | Token budget ceiling for reasoning LLM calls |
+| `leiden_gamma` | `LEIDEN_GAMMA` | `1.5` | Leiden resolution (higher = smaller communities) |
+| `gds_leiden_relationships` | `GDS_LEIDEN_RELATIONSHIPS` | `CALLS,INJECTS,...` | Edge types for Leiden projection |
+| `grep_backend` | `GREP_BACKEND` | `ripgrep` | Lexical search backend |
 | `community_summarization_enabled` | `COMMUNITY_SUMMARIZATION_ENABLED` | `true` | Toggle LLM summarization |
+| `embedding_model` | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | HuggingFace embedding model |
+| `summarizer_max_workers` | `SUMMARIZER_MAX_WORKERS` | `4` | Concurrent LLM calls |
+| `batch_size` | `BATCH_SIZE` | `500` | Neo4j APOC batch size |
+| `retry_max_attempts` | `RETRY_MAX_ATTEMPTS` | `3` | Tenacity retry attempts |
+| `log_level` | `LOG_LEVEL` | `INFO` | Root log level |
 
-### `make_llm_client()` — LLM Factory Method
+### `make_llm_client(tier="fast")` — LLM Factory Method
 
-All modules that need an LLM client call `settings.make_llm_client()` instead of constructing `OpenAI(...)` directly.  This ensures a single location controls the provider switch:
+All modules call `settings.make_llm_client(tier)` instead of constructing `OpenAI()` directly.
+`tier` accepts `"fast"` (gpt-4o-mini for bulk ops) or `"strong"` (gpt-4o for final answers).
+For Azure, the deployment name controls the model — `tier` is ignored.
 
 ```python
-def make_llm_client(self):
+def make_llm_client(self, tier: str = "fast"):
     if self.llm_provider.lower() == "azure":
         from openai import AzureOpenAI
         return AzureOpenAI(
@@ -57,82 +77,128 @@ def make_llm_client(self):
         )
     from openai import OpenAI
     return OpenAI(api_key=self.llm_api_key)
+
+def get_model_name(self, tier: str = "fast") -> str:
+    return self.llm_strong_model if tier == "strong" else self.llm_fast_model
 ```
 
-> **GPT-5 / Reasoning model notes**: GPT-5 does not accept `temperature` or `max_tokens` parameters.  Use `max_completion_tokens` only.  Internal thinking tokens count against this budget, so values < 1 000 may result in empty `content`.  Minimum recommended values: 1 800 (reduce/capability), 3 000 (search term extraction), 6 000 (narrative).
+### Two-Tier Cost Strategy
+
+| Tier | Model | Where used |
+|---|---|---|
+| `fast` | `gpt-4o-mini` | Community summarisation (bulk), map-step scoring, query expansion, L2 rollup |
+| `strong` | `gpt-4o` | Final reduce answer, L3 global rollup only |
+
+This minimises API cost: ~90% of LLM calls use the cheap model.
+A full ingest of 100 repos costs ~$0.50 vs ~$5+ if all operations used gpt-4o.
 
 ---
 
 ## `parsers/uir.py` — Universal Intermediate Representation
 
-**Purpose**: Pydantic models that define the **language-agnostic data contract** between parsers and all downstream components. The entire pipeline flows data through these models.
+**Purpose**: Pydantic models defining the language-agnostic data contract between parsers and all downstream components.
 
-### Models
+### `Parameter`
 
-#### `Parameter`
-A single method/constructor parameter. Fields: `name`, `type_name`, `doc` (from `@param` Javadoc).
+A single method/constructor parameter.
 
-#### `FieldDeclaration`
+| Field | Type | Description |
+|---|---|---|
+| `name` | `str` | Parameter identifier |
+| `type_name` | `str` | Java type (generic types preserved, e.g. `List<User>`) |
+| `doc` | `str` | Javadoc `@param` description |
+| `annotations` | `list[dict]` | Annotations on the parameter, e.g. `[{"name": "QueryParam", "value": "client_id"}]` |
+
+### `FieldDeclaration`
+
 A field declared in a class body.
-- `name`, `type_name`: The field's identifier and declared type
-- `annotations`: List of annotation strings on the field
-- `is_injected`: `True` if annotated with `@Autowired`, `@Inject`, `@Resource`, or `@Reference` — signals a `INJECTS` edge
 
-#### `LogicUnit`
-The **atomic semantic unit** — a single Java method or constructor. Maps to a Neo4j `:LogicUnit` node and two ChromaDB vectors.
+| Field | Type | Description |
+|---|---|---|
+| `name` | `str` | Field identifier |
+| `type_name` | `str` | Declared Java type |
+| `annotations` | `list[str]` | Raw annotation strings (used for DI detection) |
+| `is_injected` | `bool` | `True` if annotated with `@Autowired`, `@Inject`, `@Resource`, or `@Reference` |
 
-| Field | Description |
-|---|---|
-| `geid` | SHA256(repo::fqn)[:16] — the cross-DB bridge key |
-| `fqn` | Fully qualified name: `com.example.Service.getUser` |
-| `kind` | `"method"` or `"constructor"` |
-| `parameters` | List of `Parameter` |
-| `return_type` | Java return type string |
-| `body_text` | Raw source body for embedding |
-| `docstring` | Javadoc description block |
-| `annotations` | List of annotations (e.g. `["@Override", "@Transactional"]`) |
-| `calls` | FQNs of directly called methods → `CALLS` edges |
-| `throws` | Exception type names from `throws` clause → `THROWS` edges |
-| `overrides` | Parent method FQN if `@Override` detected → `OVERRIDES` edge |
-| `instantiates` | Class names from `new X()` expressions → `INSTANTIATES` edges |
+### `LogicUnit`
 
-#### `Component`
+The atomic semantic unit — a single Java method or constructor. Maps to a Neo4j `:LogicUnit` node and two ChromaDB vectors.
+
+| Field | Type | Description |
+|---|---|---|
+| `geid` | `str` | SHA256(repo::fqn)[:16] — cross-DB bridge key |
+| `fqn` | `str` | Fully qualified name: `com.example.Service.getUser(String)` |
+| `kind` | `str` | `"method"` or `"constructor"` |
+| `parameters` | `list[Parameter]` | Method parameters (with type, doc, and annotations) |
+| `return_type` | `str` | Java return type string |
+| `body_text` | `str` | Raw source body for embedding |
+| `docstring` | `str` | Javadoc description block |
+| `annotations` | `list[dict]` | Method-level annotations as structured dicts, e.g. `[{"name": "Override"}, {"name": "QueryParam", "value": "code"}]` |
+| `calls` | `list[str]` | FQNs of directly called methods → `CALLS` edges |
+| `throws` | `list[str]` | Exception type names from `throws` clause → `THROWS` edges |
+| `overrides` | `str \| None` | Parent method FQN if `@Override` detected → `OVERRIDES` edge |
+| `instantiates` | `list[str]` | Class names from `new X()` → `INSTANTIATES` edges |
+| `visibility` | `str` | `"public"` \| `"protected"` \| `"private"` \| `"package"` |
+| `is_static` | `bool` | Whether the method is `static` |
+| `is_abstract` | `bool` | Whether the method is `abstract` |
+| `is_final` | `bool` | Whether the method is `final` |
+| `is_synchronized` | `bool` | Whether the method is `synchronized` |
+| `lifecycle_role` | `str \| None` | OSGi lifecycle: `"activate"` \| `"deactivate"` \| `"modified"` \| `None` |
+
+### `Component`
+
 A Java class, interface, enum, or annotation type. Maps to a Neo4j `:Component` node.
 
-| Field | Description |
-|---|---|
-| `geid` | Cross-DB bridge key |
-| `fqn` | `com.example.auth.UserService` |
-| `kind` | `"class"`, `"interface"`, `"enum"`, `"annotation"` |
-| `implements` | List of interface FQNs → `IMPLEMENTS` edges |
-| `extends` | Parent class FQN → `EXTENDS` edge |
-| `logic_units` | Nested `LogicUnit` objects |
-| `fields` | `FieldDeclaration` objects → `HAS_FIELD` + `INJECTS` edges |
-| `annotations` | Class-level annotations → `ANNOTATED_WITH` edges |
-| `is_event_handler` | `True` if extends `AbstractEventHandler` or implements `EventHandler` |
+| Field | Type | Description |
+|---|---|---|
+| `geid` | `str` | Cross-DB bridge key |
+| `fqn` | `str` | `com.example.auth.UserService` |
+| `kind` | `str` | `"class"`, `"interface"`, `"enum"`, `"annotation"` |
+| `implements` | `list[str]` | Interface FQNs → `IMPLEMENTS` edges |
+| `extends` | `str \| None` | Parent class FQN → `EXTENDS` edge |
+| `logic_units` | `list[LogicUnit]` | Nested method objects |
+| `fields` | `list[FieldDeclaration]` | Field objects → `HAS_FIELD` + `INJECTS` edges |
+| `annotations` | `list[dict]` | Class-level annotations as structured dicts |
+| `is_event_handler` | `bool` | `True` if extends `AbstractEventHandler` or implements `EventHandler` |
+| `visibility` | `str` | `"public"` \| `"protected"` \| `"private"` \| `"package"` |
+| `is_abstract` | `bool` | Whether the class is `abstract` |
+| `is_final` | `bool` | Whether the class is `final` |
 
-#### `Module`
+### `Module`
+
 A Maven artifact (one `pom.xml`). Contains `components` and `dependencies` (→ `DEPENDS_ON` edges).
 
-#### `Project`
+### `Project`
+
 A Git repository. Contains `modules`. Top of the containment hierarchy.
 
 ---
 
 ## `parsers/java_parser.py` — Java AST Parser
 
-**Purpose**: Parses Java source files into UIR objects using the Tree-sitter parser. The single most complex component in the system — all structural and semantic knowledge extraction happens here.
+**Purpose**: Parses Java source files into UIR objects using Tree-sitter. All structural and semantic knowledge extraction happens here.
 
 ### Class: `JavaParser`
 
 #### `parse_file(file_path, repo_name) → list[Component]`
-Main entry point. Parses one `.java` file and returns all top-level and nested `Component` objects with their `LogicUnit` children.
+
+Main entry point. Returns all `Component` objects with their `LogicUnit` children.
 
 **Algorithm:**
 1. Parse bytes → Tree-sitter syntax tree
 2. Extract package declaration and import statements
 3. Walk `class_declaration`, `interface_declaration`, `enum_declaration` nodes
 4. For each type: extract modifiers, superclass, interfaces, body
+
+#### `_parse_annotation(node, source) → dict`
+
+Converts a Tree-sitter `marker_annotation` or `annotation` node into a structured dict.
+
+- `marker_annotation` (no args): `{"name": "Override"}`
+- Single-value `annotation` (`@Value("${key}")`): `{"name": "Value", "value": "${key}"}`
+- Named-attribute `annotation` (`@Reference(cardinality=MANDATORY)`): `{"name": "Reference", "cardinality": "MANDATORY"}`
+
+This enables: OSGi `@Reference` cardinality, JAX-RS `@QueryParam` name extraction, Spring `@Value` config key parsing.
 
 #### What Each Extraction Method Does
 
@@ -141,76 +207,143 @@ Main entry point. Parses one `.java` file and returns all top-level and nested `
 | `_extract_package` | Package name string | (context) |
 | `_extract_imports` | `{simple_name: fqn}` map for type resolution | (context) |
 | `_extract_extends` | Parent class FQN | `EXTENDS` |
-| `_extract_implements` | All implemented interface FQNs (handles `type_list` multi-interface) | `IMPLEMENTS` |
-| `_extract_parameters` | Method parameters with types | `RECEIVES` signal |
-| `_extract_return_type` | Return type string | `RETURNS` signal |
-| `_extract_calls` | All `method_invocation` nodes, best-effort FQN resolution | `CALLS` |
+| `_extract_implements` | All implemented interface FQNs | `IMPLEMENTS` |
+| `_extract_parameters` | Parameters with types **and parameter-level annotations** | `RECEIVES` signal |
+| `_extract_return_type` | Return type string (generic types preserved) | `RETURNS` signal |
+| `_extract_calls` | All `method_invocation` nodes + **lambda body recursion** | `CALLS` |
 | `_extract_throws` | Exception types from `throws` clause | `THROWS` |
-| `_extract_instantiations` | Class names from `object_creation_expression` nodes | `INSTANTIATES` |
-| `_extract_fields` | All `field_declaration` nodes; sets `is_injected=True` if DI annotation present | `HAS_FIELD`, `INJECTS` |
-| `_extract_annotations` | `marker_annotation` and `annotation` nodes | `ANNOTATED_WITH` |
+| `_extract_instantiations` | Class names from `object_creation_expression` | `INSTANTIATES` |
+| `_extract_fields` | Field declarations; sets `is_injected=True` if DI annotation present | `HAS_FIELD`, `INJECTS` |
+| `_extract_annotations` | Structured annotation dicts via `_parse_annotation()` | `ANNOTATED_WITH` |
 | `_is_event_handler` | Checks `extends`/`implements` against WSO2 event base types | `HANDLES_EVENT` |
 
+#### Modifier Extraction
+
+In `_parse_method_or_constructor`, extracts the `modifiers` child node and sets:
+
+```python
+modifiers_node = node.child_by_field_name("modifiers")
+if modifiers_node:
+    mod_text = source[modifiers_node.start_byte:modifiers_node.end_byte].decode("utf-8")
+    lu.visibility = next((m for m in ["public","protected","private"] if m in mod_text), "package")
+    lu.is_static = "static" in mod_text
+    lu.is_abstract = "abstract" in mod_text
+    lu.is_final = "final" in mod_text
+    lu.is_synchronized = "synchronized" in mod_text
+```
+
+#### OSGi Lifecycle Detection
+
+After annotation extraction, the parser checks for OSGi lifecycle annotations:
+
+```python
+_OSGI_LIFECYCLE = {"Activate": "activate", "Deactivate": "deactivate", "Modified": "modified"}
+for ann in annotations:
+    if ann.get("name", "") in _OSGI_LIFECYCLE:
+        lifecycle_role = _OSGI_LIFECYCLE[ann["name"]]
+```
+
+#### Generic Type Preservation
+
+Generic types are now preserved in `type_name` fields (e.g. `List<User>`, `Map<String,Object>`).
+Generics are stripped only when constructing FQN-based graph MERGE keys via `_type_for_graph_key()`.
+
 #### `@Override` Detection
-If a method has `@Override` in its annotations and the class has a known `extends` FQN, the parser constructs an `overrides` string as `{parent_fqn}.{method_name}` which the loader resolves to a `OVERRIDES` edge.
+
+Updated to work with the dict-format annotations:
+```python
+if any(a.get("name") == "Override" for a in annotations) and parent_extends:
+    lu.overrides = f"{parent_extends}.{method_name}"
+```
+
+#### Lambda / Stream Call Extraction
+
+The `_walk_calls` method now recurses into lambda expression bodies, capturing calls inside
+`.stream().filter(x -> x.method())` chains that were previously invisible.
 
 ---
 
-## `parsers/sql_schema_parser.py` — SQL DDL Parser (Phase 2)
+## `parsers/sql_schema_parser.py` — SQL DDL Parser
 
-**Purpose**: Scans `dbscripts/` folders in mirrored repositories for `CREATE TABLE` DDL statements. Creates `DatabaseTable` nodes in Neo4j and links DAO classes via `QUERIES_TABLE` edges.
+**Purpose**: Scans `dbscripts/` folders for `CREATE TABLE` DDL statements. Creates `DatabaseTable` nodes in Neo4j and links DAO classes via `QUERIES_TABLE` edges.
 
 ### Class: `SQLSchemaParser`
 
 #### `scan_repo(repo_path, repo_name) → tuple[list[DatabaseTableInfo], list[TableQueryEdge]]`
-Scans all `.sql` files under `dbscripts/` directories. Returns:
-- `DatabaseTableInfo` objects: `{name, repo_name, file_path, columns}` → `DatabaseTable` nodes
-- `TableQueryEdge` objects: `{component_fqn, table_name}` → `QUERIES_TABLE` edges
 
-#### Detection heuristics
-- **Table extraction**: Regex matches `CREATE TABLE [IF NOT EXISTS] [schema.]table_name`
-- **DAO detection**: Scans Java files for class names matching DAO/Repository patterns and SQL execution method calls (`executeQuery`, `PreparedStatement`, etc.)
+Returns:
+- `DatabaseTableInfo`: `{name, repo_name, file_path, columns}` → `DatabaseTable` nodes
+- `TableQueryEdge`: `{component_fqn, table_name}` → `QUERIES_TABLE` edges
+
+Detection heuristics:
+- **Table extraction**: Regex `CREATE TABLE [IF NOT EXISTS] [schema.]table_name`
+- **DAO detection**: Class names matching DAO/Repository patterns + SQL execution method calls
 
 ---
 
-## `parsers/config_parser.py` — Configuration File Parser (Phase 2)
+## `parsers/config_parser.py` — Configuration File Parser
 
-**Purpose**: Parses WSO2 `deployment.toml`, `repository/conf/*.xml`, and `application.yml` files. Creates `Configuration` nodes and `READS_CONFIG` edges.
+**Purpose**: Parses WSO2 `deployment.toml`, `repository/conf/*.xml`, `*.properties`, and `application.yml` files. Creates `Configuration` nodes and `READS_CONFIG` edges.
 
 ### Class: `ConfigurationParser`
 
-#### `scan_repo(repo_path, repo_name) → tuple[list[ConfigurationInfo], list[ConfigReadEdge]]`
-Returns:
-- `ConfigurationInfo` objects: `{config_key, config_type, source_file, repo_name}` → `Configuration` nodes
-- `ConfigReadEdge` objects: `{component_fqn, config_key}` → `READS_CONFIG` edges
+#### `scan_config_files(repo_path, repo_name) → list[ConfigurationInfo]`
 
-#### Supported file types
+Discovers and parses configuration files:
+1. `deployment.toml` — via `tomllib` (Python 3.11+ stdlib) with regex fallback
+2. `repository/conf/*.xml`, `conf/*.xml`, `src/main/resources/*.xml` — XML element names + `${placeholder}` extraction
+3. `*.properties` files — `key=value` and `key: value` patterns
+4. `application.yml` / `application.yaml` — top-level YAML keys
+
+Returns `ConfigurationInfo` objects: `{config_key, config_type, source_file, repo_name}`
+
+#### `detect_config_readers(java_files, components, known_config_keys) → list[ConfigReadEdge]`
+
+Scans Java source files for config-reading patterns:
+- `IdentityUtil.getProperty(...)`, `@Value("${key}")`, `Environment.getProperty(...)`
+- `CarbonUtils.getServerConfiguration()`, `@ConfigurationProperties`
+- `OAuthServerConfiguration`, `IdentityConfigParser`, `FileBasedConfigurationBuilder`
+
+Returns `ConfigReadEdge` objects: `{component_geid, component_fqn, config_key}`
+
+#### Supported file formats and key extraction
+
 | Format | Key extraction strategy |
 |---|---|
-| `deployment.toml` | `[section.subsection]` headings + `key=value` pairs |
-| `*.xml` | Element names + `${property.name}` placeholders |
-| `*.yml` / `*.yaml` | Top-level YAML keys (indentation=0) |
+| `deployment.toml` | `tomllib.load()` → recursive flatten to dotted keys (e.g. `[server.oauth2]` → `server.oauth2`) |
+| `*.xml` | Element names (non-generic) + `${property.name}` placeholders |
+| `*.properties` | `key=value` and `key: value` line patterns |
+| `*.yml` / `*.yaml` | Top-level YAML keys at indentation=0 |
+
+#### `tomllib` Integration (Python 3.11+)
+
+The TOML parser now uses `tomllib` from the Python 3.11+ standard library for accurate
+nested table handling. This correctly resolves `[[array.of.tables]]` and `[nested.section]`
+hierarchies. Falls back to regex-based parsing for Python < 3.11 or malformed TOML files.
+
+```python
+if sys.version_info >= (3, 11):
+    import tomllib
+    with open(toml_file, "rb") as f:
+        data = tomllib.load(f)
+    self._flatten_toml_dict(data, "", toml_file, repo_name, seen, configs)
+```
 
 ---
 
 ## `parsers/geid.py` — GEID Generator
 
-**Purpose**: Generates the **Global Entity Identifier** — a 16-character hex string that is the primary key shared between Neo4j and ChromaDB.
+**Purpose**: Generates the **Global Entity Identifier** — the 16-character hex key shared between Neo4j and ChromaDB.
 
 ```python
 geid = SHA256(f"{repo_name}::{fqn}").hexdigest()[:16]
 ```
 
-**Properties**:
-- Deterministic: same input always produces same GEID
-- Unique per entity: FQN uniqueness within a repo guarantees GEID uniqueness
-- Repository-scoped: two repos with the same class name get different GEIDs
+Properties: deterministic, unique per entity, repository-scoped, fixed length.
 
 ---
 
 ## `parsers/fqn_builder.py` — FQN Construction
-
-**Purpose**: Builds fully qualified Java names from parsed components. Centralised here so the parser doesn't contain string formatting logic.
 
 | Function | Output |
 |---|---|
@@ -222,10 +355,9 @@ geid = SHA256(f"{repo_name}::{fqn}").hexdigest()[:16]
 
 ## `parsers/javadoc_parser.py` — Javadoc Parser
 
-**Purpose**: Extracts structured data from raw `/** ... */` comment blocks for populating `LogicUnit.docstring`, `return_doc`, `throws_doc`, and parameter descriptions.
+Extracts structured data from `/** ... */` comment blocks.
 
 ### `JavadocParser.parse(raw_comment) → dict`
-Returns:
 ```python
 {
     "description": "Main narrative text",
@@ -238,178 +370,238 @@ Returns:
 ```
 
 ### `JavadocParser.format_for_embedding(parsed) → str`
-Converts the parsed dict to a flat text string optimised for semantic embedding (no `@tag` noise).
+Converts parsed dict to flat text optimised for semantic embedding (no `@tag` noise).
 
 ---
 
 ## `linker/maven_resolver.py` — Maven Dependency Resolver
 
-**Purpose**: Reads `pom.xml` files to extract module identity and Maven dependency declarations, which become `DEPENDS_ON` edges in the graph.
+**Purpose**: Reads `pom.xml` files to extract module identity and Maven dependency declarations, which become `DEPENDS_ON` edges.
 
 ### `MavenResolver`
 
-#### `find_poms(repo_path) → list[Path]`
-Recursively finds all `pom.xml` files in a repository, sorted shallow-first (root pom first).
-
-#### `parse_pom(pom_path) → tuple[dict, list[DependencyEdge]]`
-- Returns module identity dict: `{group_id, artifact_id, version}`
-- Returns list of `DependencyEdge` objects for each `<dependency>` block
-- Handles `<scope>` — test-scoped dependencies are included but marked
+| Method | Description |
+|---|---|
+| `find_poms(repo_path)` | Recursively finds all `pom.xml`, sorted shallow-first |
+| `parse_pom(pom_path)` | Returns module identity dict + list of `DependencyEdge` objects |
 
 ---
 
 ## `linker/api_bridge.py` — REST API Bridge Detector
 
-**Purpose**: Bridges the `CALLS` gap between microservices. Java services rarely call each other over gRPC in-process — they use REST. This two-pass detector identifies caller→callee relationships across service boundaries.
+**Purpose**: Bridges `CALLS` gap between microservices. Detects REST API connections across service boundaries.
 
 ### `ApiBridgeDetector`
 
 #### Pass 1 — `register_endpoints(java_files, fqn_map, geid_map)`
-Scans all Java files for Spring mapping annotations:
-- `@GetMapping("/path")`, `@PostMapping(...)`, `@PutMapping(...)`, `@DeleteMapping(...)`, `@PatchMapping(...)`
-- `@RequestMapping(value="/path", method=RequestMethod.GET)`
 
-Builds an internal endpoint registry: `[{path, http_method, handler_fqn, handler_geid}]`
+Scans for Spring and JAX-RS endpoint annotations:
+- Spring: `@GetMapping`, `@PostMapping`, `@PutMapping`, `@DeleteMapping`, `@PatchMapping`, `@RequestMapping`
+- JAX-RS: `@GET`, `@POST`, `@PUT`, `@DELETE`, `@PATCH`, `@Path`
+
+**JAX-RS path composition (v2):** Class-level `@Path` is extracted from the class header (before the first `{`) and merged with each method-level `@Path`:
+
+```python
+class_base_path = ""
+first_brace = source.find("{")
+class_header = source[:first_brace] if first_brace != -1 else source
+class_base_match = self._JAXRS_PATH_RE.search(class_header)
+if class_base_match:
+    class_base_path = class_base_match.group(1).strip()
+
+effective_path = self._normalize_path(class_base_path + "/" + method_path)
+```
+
+**Media type extraction (v2):** `@Consumes` and `@Produces` annotations are extracted and stored:
+```python
+_CONSUMES_RE = re.compile(r'@Consumes\s*\(\s*["\']?([^"\')\s]+)["\']?\s*\)')
+_PRODUCES_RE = re.compile(r'@Produces\s*\(\s*["\']?([^"\')\s]+)["\']?\s*\)')
+```
+
+#### `EndpointRegistration` dataclass
+
+| Field | Description |
+|---|---|
+| `path` | Effective path (class base + method path, normalised) |
+| `http_method` | HTTP verb |
+| `handler_fqn` | FQN of the handler method |
+| `handler_geid` | GEID of the handler |
+| `consumes` | MIME type from `@Consumes` (e.g. `application/json`) |
+| `produces` | MIME type from `@Produces` |
 
 #### Pass 2 — `detect_calls(java_files, fqn_map, geid_map) → list[RemoteCallEdge]`
-Scans all files for HTTP client invocations:
-- `restTemplate.getForObject("url", ...)`
-- `webClient.get().uri("url", ...)`
+
+Scans for HTTP client invocations:
+- `restTemplate.getForObject("url", ...)`, `webClient.get().uri("url", ...)`
 - `HttpGet("url")`, `FeignClient.get("url")`
 
-Extracts the URL literal, strips query strings, normalises path variables (`/users/{id}` ↔ `/users/123`), and matches against the registered endpoint registry.
-
-Returns `RemoteCallEdge` objects → loader creates `REMOTE_CALLS` edges.
+Extracts URL literal, strips query strings, normalises path variables, matches against endpoint registry.
 
 ---
 
 ## `graph/schema.py` — Neo4j Schema Setup
 
-**Purpose**: Creates all constraints and indexes on startup. Safe to run every time — all statements use `IF NOT EXISTS`.
+**Purpose**: Creates all constraints and indexes on startup. Safe to run every time — all use `IF NOT EXISTS`.
 
-### Constraints (8)
-Unique constraints on `geid` for: `Project`, `Module`, `Component`, `LogicUnit`  
-Unique constraints on `name`/`fqn` for: `AnnotationType`, `ExceptionType`, `EventClass`  
-Unique constraints on `name` for: `DatabaseTable` (Phase 2)  
-Unique constraints on `config_key` for: `Configuration` (Phase 2)
+### Uniqueness Constraints
 
-### Indexes (10)
-- `component_fqn` — fast MATCH by class name
-- `logicunit_fqn` — fast MATCH by method name
-- `logicunit_community` / `component_community` — community-based queries
-- `logicunit_return_type` — data flow analysis
-- `component_event_handler` — WSO2 event handler queries
-- `component_kind` / `logicunit_kind` — type filtering
-- `dbtable_repo` — DatabaseTable by repo_name (Phase 2)
-- `config_type` — Configuration by config_type (Phase 2)
+| Node Type | Unique Property |
+|---|---|
+| `Project` | `geid` |
+| `Module` | `geid` |
+| `Component` | `geid` |
+| `LogicUnit` | `geid` |
+| `AnnotationType` | `name` |
+| `ExceptionType` | `fqn` |
+| `EventClass` | `fqn` |
+| `DatabaseTable` | `name` |
+| `Configuration` | `config_key` |
+| `Specification` | `spec_id` (Sprint 2 prep) |
+
+### Lookup Indexes
+
+| Index | Purpose |
+|---|---|
+| `component_fqn` | Fast MATCH by class name |
+| `logicunit_fqn` | Fast MATCH by method name |
+| `logicunit_community` / `component_community` | Community-based queries |
+| `logicunit_return_type` | Data flow analysis |
+| `component_event_handler` | WSO2 event handler queries |
+| `component_kind` / `logicunit_kind` | Type filtering |
+| `dbtable_repo` | `DatabaseTable` by repo_name |
+| `config_type` | `Configuration` by config_type |
+| `logicunit_visibility` | Security analysis: filter by `public`/`private` |
+| `component_visibility` | Security analysis: filter by `public`/`private` |
+| `logicunit_lifecycle` | OSGi lifecycle queries |
+| `spec_rfc` | `Specification` nodes by RFC number (Sprint 2) |
 
 ### Fulltext Index
-`code_search` — fulltext search across `fqn` and `docstring` on both `LogicUnit` and `Component` nodes.
+
+`code_search` — fulltext across `fqn` and `docstring` on both `LogicUnit` and `Component`.
 
 ---
 
 ## `graph/loader.py` — Neo4j Bulk Loader
 
-**Purpose**: Takes UIR objects and creates/updates Neo4j nodes and relationships using `MERGE` (idempotent upsert). All write queries call `.consume()` to prevent lazy-execution silent drops.
+**Purpose**: Takes UIR objects and creates/updates Neo4j nodes and relationships using `MERGE` (idempotent). All writes call `.consume()` to prevent lazy-execution silent drops.
 
 ### Critical Design: `.consume()` on All Writes
-Neo4j's Python driver is **lazy** — `session.run()` only *prepares* the query. Without consuming the result, write queries may never execute. Every write in this file ends with `.consume()`.
+
+Neo4j's Python driver is **lazy** — `session.run()` only *prepares* the query. Without consuming the result, write queries may never execute. Every write ends with `.consume()`.
+
+### Annotation Storage
+
+`list[dict]` annotations cannot be stored natively in Neo4j (no maps-in-lists). They are serialized as JSON strings before writing and must be deserialized on read:
+
+```python
+import json
+# Writing
+annotations=json.dumps(comp.annotations)   # e.g. '[{"name": "Component"}, {"name": "Transactional"}]'
+# Reading (in queries)
+# apoc.convert.fromJsonList(n.annotations)
+```
 
 ### Public Methods
 
-| Method | Creates | Tier |
+| Method | Creates | Notes |
 |---|---|---|
-| `load_project(project)` | Project→Module→Component→LogicUnit nodes (skeleton) | Always |
-| `load_dependency_edges(mod_geid, deps)` | `DEPENDS_ON` | 1 |
-| `load_implements_extends(all_components)` | `IMPLEMENTS` + `EXTENDS` (2-pass bulk) | 1 |
-| `load_call_graph(logic_units)` | `CALLS` (APOC batch) | 1 |
-| `load_type_edges(logic_units)` | `RETURNS` + `RECEIVES` | 2 |
-| `load_injection_edges(all_components)` | `INJECTS` | 2 |
-| `load_annotated_with(all_components)` | `ANNOTATED_WITH` | 2 |
-| `load_remote_calls(edges)` | `REMOTE_CALLS` | 2 |
-| `load_throws_edges(logic_units)` | `THROWS` | 3 |
-| `load_overrides_edges(logic_units)` | `OVERRIDES` | 3 |
-| `load_instantiates_edges(logic_units)` | `INSTANTIATES` | 3 |
-| `load_event_handler_edges(all_components)` | `HANDLES_EVENT` | 3 |
-| `load_database_tables(tables)` | `DatabaseTable` nodes | Phase 2 |
-| `load_queries_table_edges(edges)` | `QUERIES_TABLE` | Phase 2 |
-| `load_configuration_nodes(configs)` | `Configuration` nodes | Phase 2 |
-| `load_reads_config_edges(edges)` | `READS_CONFIG` | Phase 2 |
+| `load_project(project)` | Project→Module→Component→LogicUnit nodes | Includes visibility, modifiers, lifecycle_role, annotations (JSON) |
+| `load_dependency_edges(mod_geid, deps)` | `DEPENDS_ON` | |
+| `load_implements_extends(all_components)` | `IMPLEMENTS` + `EXTENDS` (2-pass bulk) | Both nodes must exist first |
+| `load_call_graph(logic_units)` | `CALLS` (APOC batch) | |
+| `load_type_edges(logic_units)` | `RETURNS` + `RECEIVES` | |
+| `load_injection_edges(all_components)` | `INJECTS` | |
+| `load_annotated_with(all_components)` | `ANNOTATED_WITH` | Handles both dict and string annotation formats |
+| `load_remote_calls(edges)` | `REMOTE_CALLS` | |
+| `load_throws_edges(logic_units)` | `THROWS` | |
+| `load_overrides_edges(logic_units)` | `OVERRIDES` | |
+| `load_instantiates_edges(logic_units)` | `INSTANTIATES` | |
+| `load_event_handler_edges(all_components)` | `HANDLES_EVENT` | |
+| `load_database_tables(tables)` | `DatabaseTable` nodes | |
+| `load_queries_table_edges(edges)` | `QUERIES_TABLE` | |
+| `load_configuration_nodes(configs)` | `Configuration` nodes | |
+| `load_reads_config_edges(edges)` | `READS_CONFIG` | |
 
-### Why Two-Pass for IMPLEMENTS/EXTENDS?
-Both nodes must exist before an edge can be created with `MATCH`. By calling `load_implements_extends()` *after* all `load_project()` calls, all `Component` nodes are guaranteed to exist in the database.
+### `load_annotated_with` (Updated)
+
+Now handles both the new `list[dict]` format and legacy `list[str]` format:
+```python
+ann_name = ann.get("name", "") if isinstance(ann, dict) else ann.lstrip("@").split("(")[0].strip()
+```
+
+### New Node Properties Written
+
+**LogicUnit** (added in v2 Sprint 1):
+- `visibility` (`"public"` | `"protected"` | `"private"` | `"package"`)
+- `is_static`, `is_abstract`, `is_final`, `is_synchronized` (bool)
+- `lifecycle_role` (`""` | `"activate"` | `"deactivate"` | `"modified"`)
+
+**Component** (added in v2 Sprint 1):
+- `visibility`, `is_abstract`, `is_final`
 
 ---
 
 ## `graph/gds_client.py` — Graph Data Science Client
 
-**Purpose**: Manages the Neo4j GDS in-memory graph projection and runs the Leiden community detection algorithm.
-
 ### Class: `GDSClient`
 
 #### `run_leiden() → dict`
-Full Leiden workflow:
-1. Drops any existing projection with the same name (cleanup)
-2. Queries `db.relationshipTypes()` → dynamically builds projection
-3. Projects 5 node labels + all present candidate relationship types
-4. Runs `gds.leiden.write` → writes `community_id` to each node
-5. Drops the projection (frees GDS memory)
-6. Returns `{communityCount, modularity, ranLevels}`
 
-#### Dynamic Projection (Key Design)
-The projection only includes relationship types that **actually exist** in the database:
-```python
-existing = db.relationshipTypes()  # e.g. ["CALLS", "IMPLEMENTS", ...]
-project = [r for r in CANDIDATES if r in existing]
-```
-This prevents the `Failed to invoke procedure gds.leiden.write` crash on partial ingests.
+1. Drop any existing projection with the same name
+2. Query `db.relationshipTypes()` → dynamically build projection (resilient to partial ingests)
+3. Project 5 node labels + all present candidate relationship types
+4. Run `gds.leiden.write` → writes `community_id` to each node
+5. Drop the projection (frees GDS memory)
+6. Return `{communityCount, modularity, ranLevels}`
 
-#### Other Methods
+#### Dynamic Projection
+
+Only includes relationship types that **actually exist** in the database. Prevents the
+`Failed to invoke procedure gds.leiden.write` crash on partial ingests.
+
+The `GDS_LEIDEN_RELATIONSHIPS` setting controls which edge types are projected. Excludes
+high-fan-out utility edges (`THROWS`, `RETURNS`, `RECEIVES`, `INSTANTIATES`) that cause "God Node" collapse.
+
 | Method | Description |
 |---|---|
 | `get_community_count()` | Count distinct `community_id` values |
-| `get_nodes_by_community(cid)` | All `LogicUnit` nodes in a community |
-| `list_community_ids()` | All distinct community IDs in the graph |
+| `get_nodes_by_community(cid)` | All `LogicUnit` + `Component` nodes in a community |
+| `get_community_boundary_edges(cid)` | Inter-community edges (for prompt builder) |
+| `list_community_ids()` | All distinct community IDs |
 
 ---
 
-## `graph/tagger.py` — EntryPoint / DataSink Tagger (Phase 2)
-
-**Purpose**: Tags Neo4j nodes with secondary labels for execution flow analysis. `:EntryPoint` marks API endpoints; `:DataSink` marks database access classes.
+## `graph/tagger.py` — EntryPoint / DataSink Tagger
 
 ### Class: `NodeTagger`
-
-#### `tag_all() → dict`
-Runs all tagging passes and returns `{entry_points: int, data_sinks: int}`.
 
 | Pass | Labels Applied | Detection Criteria |
 |---|---|---|
 | `_tag_entry_points()` | `:EntryPoint` | `@RequestMapping`, `@Path`, `HttpServlet`, Servlet/Controller/Endpoint/Resource FQN patterns |
-| `_tag_data_sinks()` | `:DataSink` | `@Repository`, DAO/Repository class patterns, `QUERIES_TABLE` edges, SQL execution method call indicators |
+| `_tag_data_sinks()` | `:DataSink` | `@Repository`, DAO/Repository patterns, `QUERIES_TABLE` edges, SQL execution method indicators |
 
 ---
 
-## `graph/flow_extractor.py` — GDS Dijkstra Flow Extractor (Phase 2)
-
-**Purpose**: Uses GDS Dijkstra Shortest Path to find primary execution paths between EntryPoints and DataSinks.
+## `graph/flow_extractor.py` — GDS Dijkstra Flow Extractor
 
 ### Class: `FlowExtractor`
 
 #### `extract_all_flows() → list[FlowPath]`
-1. Projects execution-flow edges (CALLS, INJECTS, IMPLEMENTS, OVERRIDES, REMOTE_CALLS) into a GDS graph `nexus-flow-graph`
-2. Queries all `:EntryPoint` and `:DataSink` nodes
-3. For each (EntryPoint, DataSink) pair: `gds.shortestPath.dijkstra.stream`
-4. Enriches each path with `READS_CONFIG` config keys and `QUERIES_TABLE` table names
-5. Drops the GDS graph projection
-6. Returns `FlowPath` objects
+
+1. Project execution-flow edges into GDS `nexus-flow-graph`
+2. Query all `:EntryPoint` and `:DataSink` nodes
+3. For each pair: `gds.shortestPath.dijkstra.stream` — O(E log V) per path
+4. Enrich paths with `READS_CONFIG` keys and `QUERIES_TABLE` table names
+5. Drop the GDS projection
 
 ### `FlowPath`
+
 | Field | Description |
 |---|---|
 | `entry_fqn` | Starting API endpoint FQN |
 | `sink_fqn` | Terminal database/repository FQN |
 | `path_fqns` | Ordered list of FQNs along the path |
-| `config_keys` | Configuration keys read along the path |
+| `config_keys` | Config keys read along the path |
 | `table_names` | Database tables accessed along the path |
 | `total_cost` | GDS Dijkstra path cost |
 
@@ -417,57 +609,59 @@ Runs all tagging passes and returns `{entry_points: int, data_sinks: int}`.
 
 ## `pipeline/mirror.py` — Repository Mirror
 
-**Purpose**: Clones or pulls Git repositories defined in `repos.yaml` into the local `./mirror/` directory.
-
 ### `RepositoryMirror`
 
-#### `mirror_all(config_path) → list[Path]`
-Reads `repos.yaml`, calls `mirror_repo()` for each entry, returns list of local paths.
-
-#### `mirror_repo(repo_config) → Path`
-- **First run**: `git clone --branch {branch} {url} mirror/{name}`
-- **Subsequent runs**: `git pull origin {branch}` in the existing mirror directory
-- Returns the local path for downstream processing
+| Method | Description |
+|---|---|
+| `mirror_all(config_path)` | Reads `repos.yaml`, calls `mirror_repo()` for each, returns local paths |
+| `mirror_repo(repo_config)` | First run: `git clone`; subsequent: `git pull` |
 
 ---
 
 ## `pipeline/orchestrator.py` — Ingestion Pipeline Orchestrator
 
-**Purpose**: The top-level coordinator that sequences all pipeline stages. This is the entry point called by `main.py`.
-
 ### Class: `IngestionPipeline`
 
-The `__init__` method wires up all clients: Neo4j driver, ChromaDB, Redis, and all the worker components.
-
 #### `run(config_path, skip_summarization) → dict`
-Executes the complete pipeline in order:
 
+Complete pipeline in order:
 1. `apply_schema()` — idempotent schema setup
 2. `mirror.mirror_all()` — Stage 1: clone/pull repos
 3. Per-repo loop: parse Java → load Neo4j nodes → embed ChromaDB
 4. Cross-repo link phase (Tier 1 → Tier 2 → Tier 3 edges)
 5. `gds.run_leiden()` — community detection
-6. `summarizer.summarize_all()` — LLM summaries (optional)
+6. `summarizer.summarize_all()` — LLM summaries (optional, uses fast model)
 
-Returns stats dict: `{repos_mirrored, files_parsed, components, logic_units, call_edges, implements_edges, depends_on_edges, remote_calls, communities}`
+Returns stats dict: `{repos_mirrored, files_parsed, components, logic_units, call_edges, ...}`.
 
-**Status tracking**: Writes current stage name to Redis key `nexus:pipeline:stage` — can be polled by a monitoring dashboard.
+**Status tracking**: Writes current stage to Redis key `nexus:pipeline:stage`.
+
+---
+
+## `pipeline/incremental.py` — Incremental Updater
+
+**Purpose**: Re-parses only changed files after a PR merge. Updates only affected Neo4j nodes and ChromaDB vectors. Much faster than a full re-ingest.
+
+---
+
+## `pipeline/cli.py` — Click CLI
+
+Defines `nexus ingest`, `nexus update`, `nexus validate`, `nexus stats`, `nexus analyze-pr` commands.
 
 ---
 
 ## `vectorstore/chunker.py` — UIR Chunker
 
-**Purpose**: Converts `LogicUnit` objects into `EmbeddingChunk` objects ready for ChromaDB. Implements **functional chunking** — one method = one chunk — rather than character-count-based splitting.
-
 ### `UIRChunker`
 
 #### `chunk_logic_unit(lu) → list[EmbeddingChunk]`
+
 Returns 1–2 chunks per `LogicUnit`:
+- **`code_logic`**: method signature + raw body — captures *what the code does*
+- **`code_intent`**: parsed and formatted Javadoc — captures *what the developer intended*
 
-- **`code_logic`** chunk (always): method signature + raw body text. Captures *what the code does*.
-- **`code_intent`** chunk (if Javadoc exists): parsed and formatted Javadoc. Captures *what the developer intended*.
+### `EmbeddingChunk`
 
-#### `EmbeddingChunk` Fields
 | Field | Description |
 |---|---|
 | `chunk_id` | `"{geid}_{chunk_type}"` — unique ChromaDB document ID |
@@ -480,20 +674,18 @@ Returns 1–2 chunks per `LogicUnit`:
 
 ## `vectorstore/embedder.py` — ChromaDB Embedder
 
-**Purpose**: Manages two ChromaDB collections and handles batch upsert of `EmbeddingChunk` objects.
-
 ### Collections
+
 | Collection | Embeds | Use Case |
 |---|---|---|
 | `code_logic` | Method body text | "Find code that does X" |
 | `code_intent` | Javadoc description text | "Find code intended for X" |
 
-Both use `all-MiniLM-L6-v2` (384-dimensional embeddings, fast inference, multilingual).
+Both use `all-MiniLM-L6-v2` (384-dimensional, CPU-only, no API key).
 
-### Key Methods
 | Method | Description |
 |---|---|
-| `upsert_chunks(chunks)` | Batch upsert, splits by type, batches at 100 per call |
+| `upsert_chunks(chunks)` | Batch upsert, splits by type, batches at `EMBEDDING_BATCH_SIZE` per call |
 | `semantic_search(query, collection, n_results)` | KNN similarity search |
 | `get_by_geid(geid, collection)` | Direct GEID lookup |
 
@@ -501,17 +693,16 @@ Both use `all-MiniLM-L6-v2` (384-dimensional embeddings, fast inference, multili
 
 ## `community/models.py` — Community Summary Model
 
-**Purpose**: Pydantic model for a generated community summary.
-
 ### `CommunitySummary`
+
 | Field | Description |
 |---|---|
 | `community_id` | Leiden integer community ID |
 | `summary_text` | LLM-generated architectural summary |
-| `node_count` | Number of `LogicUnit` members |
+| `node_count` | Number of member nodes |
 | `fqn_list` | All member FQNs |
 | `top_fqns` | Top 5 representative methods |
-| `llm_model` | Model used for generation |
+| `llm_model` | Model used (fast model: `gpt-4o-mini`) |
 | `token_count` | Total prompt tokens consumed |
 | `prompt_truncated` | `True` if prompt was budget-capped |
 | `generated_at` | UTC timestamp |
@@ -522,46 +713,62 @@ Both use `all-MiniLM-L6-v2` (384-dimensional embeddings, fast inference, multili
 
 **Purpose**: Builds token-budget-enforced prompts for community summarization.
 
-### `build_community_prompt(community_id, nodes) → tuple[str, bool]`
-Constructs a prompt listing all member FQNs and docstrings. If the total exceeds `CONTEXT_BUDGET` tokens (7,000), it truncates nodes from the end and returns `(prompt, True)` to signal truncation.
+### Token Budget
 
-### `SYSTEM_PROMPT`
-Instructs the LLM to act as a senior Java architect, summarise the community's architectural role, and identify cross-cutting concerns.
+```python
+SYSTEM_TOKENS = 200       # reserved for the system prompt
+OUTPUT_RESERVE = 1000     # reserved for the model's output
+DATA_BUDGET = settings.max_context_tokens - SYSTEM_TOKENS - OUTPUT_RESERVE
+# With max_context_tokens=8000: DATA_BUDGET = 6800 tokens
+```
+
+### `build_community_prompt(community_id, nodes, boundary_edges) → tuple[str, bool]`
+
+Constructs a prompt listing all class and method FQNs with docstrings, followed by
+inter-community boundary edge summary (optional). If the body exceeds `DATA_BUDGET` tokens,
+truncates nodes from the end (lowest priority = last methods) and returns `(prompt, True)`.
+
+The while loop checks `count_tokens(body) <= DATA_BUDGET` — `body` is just the prompt body,
+not including the system prompt overhead. This was a bug in v1 that allowed the body to
+slightly exceed DATA_BUDGET; fixed in v2.
 
 ---
 
 ## `community/summarizer.py` — Community Summarizer
 
-**Purpose**: For each Leiden community, fetches member nodes, calls GPT-4o-mini, and stores the summary in ChromaDB.
-
 ### `CommunitySummarizer`
 
 #### `summarize_all() → list[CommunitySummary]`
-Iterates all community IDs from `gds_client.list_community_ids()`, calls `summarize_community()` for each, logs errors without stopping the pipeline.
+
+Iterates all community IDs, calls `summarize_community()` for each.
+Uses `ThreadPoolExecutor` with `SUMMARIZER_MAX_WORKERS` concurrent LLM calls.
+Logs errors without stopping the pipeline.
 
 #### `summarize_community(community_id) → CommunitySummary`
-1. `gds_client.get_nodes_by_community(cid)` → list of nodes
+
+1. `gds_client.get_nodes_by_community(cid)` → node list
 2. `build_community_prompt(cid, nodes)` → token-capped prompt
-3. OpenAI chat completion → summary text
+3. OpenAI chat completion using **fast model** (`gpt-4o-mini`)
 4. `_upsert_to_chroma(summary)` → stores in `community_summaries` collection
 
 ---
 
-## `community/global_rollup.py` — Global GraphRAG Rollup (Phase 2)
+## `community/global_rollup.py` — Global GraphRAG Rollup
 
-**Purpose**: Implements the Microsoft GraphRAG hierarchical rollup — generates Level 2 (Sub-System) and Level 3 (Global Architecture) summaries from Level 1 community summaries.
+**Purpose**: Microsoft GraphRAG hierarchical rollup — generates L2 and L3 summaries.
 
-### Class: `GlobalRollup`
+### `GlobalRollup`
 
 #### `run_full_rollup() → dict`
-Complete hierarchical rollup:
-1. Fetches all L1 community summaries from ChromaDB `community_summaries`
-2. Groups them into 11 domains via keyword heuristics
-3. Generates L2 sub-system summaries (one per domain) via GPT-4o-mini
-4. Generates L3 Global Architecture Document from all L2 summaries
-5. Returns `{l2_count, l3_generated, domains}`
+
+1. Fetch all L1 community summaries from ChromaDB
+2. Group into 11 domains via keyword heuristics
+3. Generate L2 sub-system summaries via **fast model**
+4. Generate L3 Global Architecture Document (one call via **strong model**)
+5. Return `{l2_count, l3_generated, domains}`
 
 #### Domain classification (11 sub-systems)
+
 | Domain | Keyword triggers |
 |---|---|
 | Authentication | auth, login, password, credential, SSO, SAML |
@@ -576,41 +783,133 @@ Complete hierarchical rollup:
 | Token Exchange | token exchange, impersonation, delegation, act claim |
 | Utility / Common | (default bucket for unmatched communities) |
 
-#### `get_global_summary() → str`
-Returns the L3 Global Architecture Document.
+---
 
-#### `get_subsystem_summary(domain) → str`
-Returns the L2 summary for a specific domain.
+## `reasoning/router.py` — Query Router
+
+**Purpose**: Classifies every incoming question into one of four routes.
+
+| Route | Trigger | LLM calls | Method |
+|---|---|---|---|
+| **A — SYMBOLIC** | Exact code symbol (e.g. `IMPERSONATED_SUBJECT`) | 0 | Ripgrep → Neo4j by FQN |
+| **B — EXACT-ENTITY** | Named class/method (e.g. `TokenExchangeGrantHandler`) | 0 | Neo4j MATCH by name |
+| **C — SEMANTIC** | Conceptual question | 1 (reduce step only) | ChromaDB vector search |
+| **D — GLOBAL** | Architecture overview | 0 | Returns L3/L2 summaries directly |
+
+Routes A and B are 100% deterministic — same question always returns evidence from same code.
 
 ---
 
-## `reasoning/pipeline.py` — GraphRAG Reasoning Pipeline
+## `reasoning/map_step.py` — Map Step
 
-**Purpose**: Orchestrates the complete Map-Reduce reasoning query — the public API for the agent layer.
+**Purpose**: First stage of GraphRAG reasoning. Retrieves and scores community summaries.
 
-### `GraphRAGPipeline`
+### `MapStep`
 
-#### `analyze(pr_summary) → str`
-1. `MapStep.run(pr_summary)` → scored community list
-2. `ReduceStep.run(map_results)` → final review string
+#### `run(input_text, restrict_community_ids, mode) → list[MapResult]`
 
-Returns a markdown-formatted architectural impact review.
+| Mode | Trigger | LLM calls | Scoring method |
+|---|---|---|---|
+| `question` | Route C semantic queries | **0** | ChromaDB cosine distance → 0-100 score |
+| `pr` | Blast-radius PR analysis | Up to 50 | `ThreadPoolExecutor` LLM scoring |
+
+#### Question mode — ChromaDB distance scoring (zero LLM calls)
+
+```python
+results = collection.query(query_texts=[question], n_results=20, include=["distances", ...])
+score = max(0, round((1.0 - distance / 2.0) * 100))
+# Typical scores for broad queries: 40-57 (NOT 70-100)
+# Do NOT apply LLM threshold (70) to question-mode results — all results would be filtered out
+```
+
+#### PR mode — LLM scoring
+
+```python
+n = min(max(n_candidates, total // 4), 50)   # capped at 50 candidates
+# ThreadPoolExecutor calls _score_community() per candidate using fast model
+```
+
+### `MapResult`
+
+`community_id`, `score` (0–100), `reason` (1 sentence), `summary_text`
+
+### Score interpretation
+
+| Range | Mode | Meaning |
+|---|---|---|
+| 70–100 | `pr` LLM | High blast-radius impact |
+| 30–69 | `pr` LLM | Moderate impact |
+| 50–57 | `question` ChromaDB | Top vector similarity hit |
+| 40–49 | `question` ChromaDB | Relevant but not a close match |
 
 ---
 
-## `reasoning/flow_summarizer.py` — Flow Narrative Summariser (Phase 2)
+## `reasoning/reduce_step.py` — Reduce Step
 
-**Purpose**: Generates natural-language "End-to-End Architectural Stories" from GDS Dijkstra execution paths.
+**Purpose**: Synthesises the final answer from Map results and evidence. Uses **strong model** (`gpt-4o`).
 
-### Class: `FlowNarrativeSummarizer`
+### `ReduceStep`
+
+#### `run(map_results, query, primary_targets, code_snippets) → str`
+
+1. `_detect_intent(query)` — classifies into 6 intents
+2. `_build_summaries_text(map_results, budget)` — assembles community block text, trims from lowest-score end, always retains at least 1 entry
+3. `_format_code_snippets(snippets, budget)`
+4. Selects system prompt + template based on intent
+5. Single LLM call via **strong model**
+
+### Intent Detection
+
+| Intent | Keywords | Output Tokens | System Prompt |
+|---|---|---|---|
+| `code` | `show me`, `give me`, `how is X implemented`, `source of` | 1 800 | `SYSTEM_IMPACT` |
+| `safety` | `can I remove`, `is it safe`, `dead code`, `safe to delete` | 1 800 | `SYSTEM_SAFETY` |
+| `capability` | `does this support`, `is X enforced`, `can X bypass` | 1 800 | `SYSTEM_CAPABILITY` |
+| `impact` | `blast radius`, `what breaks`, `impact`, `dependency` | 1 800 | `SYSTEM_IMPACT` |
+| `narrative` | `full story`, `end-to-end`, `how does X get evaluated`, `walk me through` | **6 000** | `SYSTEM_NARRATIVE` |
+| `general` | *(fallback)* | **6 000** | `SYSTEM_GENERAL` |
+
+### Token Budget Constants
+
+| Constant | Value | Used for |
+|---|---|---|
+| `OUTPUT_RESERVE` | 1 800 | safety / capability / impact / code |
+| `NARRATIVE_RESERVE` | 6 000 | narrative / general |
+| `SNIPPET_BUDGET` | 50% of DATA_BUDGET | default code snippet budget |
+| `SUMMARY_BUDGET` | 40% of DATA_BUDGET | default community summary budget |
+
+---
+
+## `reasoning/graph_retriever.py` — Neo4j Graph Retriever
+
+**Purpose**: Given seed FQNs, traverses the call graph to find all affected code (blast radius). Also supports entity lookup by name, grep-to-graph bridging, and community summary fetching.
+
+---
+
+## `reasoning/lexical_search.py` — Lexical Searcher
+
+**Purpose**: Runs ripgrep, git-grep, or pure-Python grep over `./mirror/` to find exact text matches. Returns file path + line number + matching line.
+
+---
+
+## `reasoning/code_fetcher.py` — Source Code Reader
+
+**Purpose**: Given a file path and line numbers, reads the actual `.java` file from `./mirror/` and returns the source as a string for inclusion in LLM context.
+
+---
+
+## `reasoning/flow_summarizer.py` — Flow Narrative Summariser
+
+**Purpose**: Converts `FlowPath` objects (API→DB execution paths) into natural-language architectural stories via **fast model**.
+
+### `FlowNarrativeSummarizer`
 
 #### `summarize_all(flow_paths) → list[FlowNarrative]`
-Parallel LLM calls via `ThreadPoolExecutor`. For each `FlowPath`:
-1. Builds a structured prompt with entry FQN, sink FQN, path nodes, config keys, table names
-2. Calls GPT-4o-mini to produce a narrative
-3. Upserts to ChromaDB `flow_narratives` collection
+
+Parallel LLM calls via `ThreadPoolExecutor`. Each narrative describes: business process, data transformations, services crossed, tables written to, config keys consulted.
 
 ### `FlowNarrative`
+
 | Field | Description |
 |---|---|
 | `flow_id` | `"flow_{entry_hash}_{sink_hash}"` |
@@ -621,111 +920,7 @@ Parallel LLM calls via `ThreadPoolExecutor`. For each `FlowPath`:
 
 ---
 
-## `reasoning/map_step.py` — Map Step
-
-**Purpose**: First stage of GraphRAG reasoning. Retrieves community summaries from ChromaDB and scores them for relevance. Operates in two distinct modes.
-
-### `MapStep`
-
-#### `run(input_text, restrict_community_ids, mode) → list[MapResult]`
-
-Dispatches to one of two paths based on `mode`:
-
-| Mode | Trigger | LLM calls | Method called |
-|---|---|---|---|
-| `question` | All Route C semantic queries | **0** | `_retrieve_candidates_with_distances()` |
-| `pr` | Blast-radius PR analysis | Up to 50 (ThreadPoolExecutor) | `_retrieve_candidates()` + `_llm_score()` |
-
-#### Mode: `question` — ChromaDB distance scoring (zero LLM calls)
-
-```python
-# Fetches top n_candidates (default 20) with distances included
-results = collection.query(query_texts=[question], n_results=n,
-                           include=["documents", "metadatas", "distances"])
-# Converts ChromaDB cosine distance (0=identical, 2=opposite) to 0-100 score
-score = max(0, round((1.0 - distance / 2.0) * 100))
-# Typical scores for broad queries: 40-57 (NOT 70-100 — do NOT apply LLM threshold)
-```
-
-#### Mode: `pr` — LLM scoring (blast-radius analysis)
-
-```python
-# Scaling formula capped at 50 (was 200 before the fix)
-n = min(max(n_candidates, total // 4), 50)
-# ThreadPoolExecutor calls _score_community() per candidate
-```
-
-#### `restrict_community_ids` path
-
-When provided (deterministic routes A/B), bypasses ChromaDB entirely and uses `_retrieve_by_ids()`.  Always goes through `_llm_score()` regardless of `mode` — deterministic IDs have no distance scores.
-
-### `MapResult` Fields
-`community_id`, `score` (0–100), `reason` (1 sentence or `"ChromaDB similarity score"`), `summary_text`
-
-### Score interpretation
-
-| Score range | Mode | Meaning |
-|---|---|---|
-| 70–100 | `pr` LLM | High blast-radius impact |
-| 30–69 | `pr` LLM | Moderate impact |
-| 0–29 | `pr` LLM | Low / no impact |
-| 50–57 | `question` ChromaDB | Top vector similarity hit |
-| 40–49 | `question` ChromaDB | Relevant but not a close match |
-
-> **Important**: ChromaDB distance scores never reach 70. Applying the LLM threshold (70) to semantic-route map results produces `communities=0` and an empty response. The main pipeline passes all map results through; only `_build_summaries_text()` applies a `>= 50` filter internally.
-
----
-
-## `reasoning/reduce_step.py` — Reduce Step
-
-**Purpose**: Synthesises the final answer from Map results and grounded evidence. Uses query-intent detection to choose the correct system prompt, template, and token budget.
-
-### `ReduceStep`
-
-#### `run(map_results, query, primary_targets, code_snippets) → str`
-
-1. `_detect_intent(query)` — classifies into one of 6 intents
-2. `_build_summaries_text(map_results, budget)` — assembles community block text, trims from lowest-score end if over token budget, **always keeps at least 1 entry**
-3. `_format_code_snippets(snippets, budget)` — formats code blocks, respects per-intent budget
-4. Selects system prompt + template based on intent
-5. Single LLM call with `max_completion_tokens` set per intent
-
-### Intent Detection — `detect_query_intent(query) → str`
-
-Module-level function importable by `main.py` without instantiating `ReduceStep`.
-
-| Intent | Regex / Keywords | Output Tokens | System Prompt |
-|---|---|---|---|
-| `code` | `show me`, `give me`, `how is X implemented`, `source of` | 1 800 | `SYSTEM_IMPACT` |
-| `safety` | `can I remove`, `is it safe`, `dead code`, `safe to delete` | 1 800 | `SYSTEM_SAFETY` |
-| `capability` | `does this support`, `is X enforced`, `can X bypass` | 1 800 | `SYSTEM_CAPABILITY` |
-| `impact` | `blast radius`, `what breaks`, `impact`, `dependency` | 1 800 | `SYSTEM_IMPACT` |
-| `narrative` | `full story`, `end-to-end`, `how does X get evaluated`, `walk me through`, `explain how`, `step by step` | **6 000** | `SYSTEM_NARRATIVE` |
-| `general` | *(fallback)* | **6 000** | `SYSTEM_GENERAL` |
-
-### `_build_summaries_text(map_results, budget)`
-
-- Filters `score >= 50`; if none qualify, falls back to top-10 by score
-- Trims from the bottom of the list until within `budget` tokens
-- **Always retains at least 1 entry** (was a bug: the previous `while lines:` loop could empty the list when a single summary exceeded the budget)
-- For narrative queries, `NARRATIVE_SUMMARY_BUDGET` (~12 900 tokens) is passed instead of the default `SUMMARY_BUDGET` (~12 000)
-
-### Token Budget Constants
-
-| Constant | Value | Used for |
-|---|---|---|
-| `OUTPUT_RESERVE` | 1 800 | safety / capability / impact / code |
-| `NARRATIVE_RESERVE` | 6 000 | narrative / general |
-| `SNIPPET_BUDGET` | 50% of DATA_BUDGET | default code snippet budget |
-| `SUMMARY_BUDGET` | 40% of DATA_BUDGET | default community summary budget |
-| `NARRATIVE_SNIPPET_BUDGET` | 40% of NARRATIVE_DATA_BUDGET | narrative code snippets |
-| `NARRATIVE_SUMMARY_BUDGET` | 50% of NARRATIVE_DATA_BUDGET | narrative community summaries |
-
----
-
 ## `sample_repos/repos.yaml` — Repository Configuration
-
-**Purpose**: Declares which Git repositories to mirror and ingest.
 
 ```yaml
 repos:
@@ -737,17 +932,15 @@ repos:
     branch: master
 ```
 
-Each entry: `name` (used in GEID generation), `url` (git remote), `branch` (default branch).
+Each entry: `name` (used in GEID generation), `url` (git remote), `branch`.
 
 ---
 
 ## `docker-compose.yml` — Services
 
-**Purpose**: Starts the three required backing services.
-
 | Service | Image | Port | Purpose |
 |---|---|---|---|
-| `neo4j` | `neo4j:5.x` with APOC + GDS plugins | 7474 (HTTP), 7687 (Bolt) | Property graph + Leiden + Dijkstra |
+| `neo4j` | `neo4j:5.x` with APOC + GDS | 7474 (HTTP), 7687 (Bolt) | Property graph + Leiden + Dijkstra |
 | `chromadb` | `ghcr.io/chroma-core/chroma:0.4.15` | 8000 | Vector store (6 collections) |
 | `redis` | `redis:7` | 6379 | Pipeline state |
 

@@ -1,0 +1,50 @@
+# CodeNexus — Python dependencies
+# Install with: pip install -r requirements.txt
+# Requires Python >= 3.11 (tomllib stdlib; Python 3.14 supported for unit tests)
+
+# ── Core data models ─────────────────────────────────────────────────────────
+pydantic>=2.0,<3.0
+pydantic-settings>=2.0,<3.0
+
+# ── Java AST parser ──────────────────────────────────────────────────────────
+tree-sitter>=0.20
+tree-sitter-java>=0.20
+
+# ── Graph database (Neo4j) ───────────────────────────────────────────────────
+# Deferred import in fixtures — safe to install on Python 3.14
+neo4j>=5.0,<6.0
+
+# ── Vector store (ChromaDB) ──────────────────────────────────────────────────
+# Deferred import in fixtures — safe to install on Python 3.14
+chromadb>=0.4.0,<0.6.0
+
+# ── Embeddings ───────────────────────────────────────────────────────────────
+sentence-transformers>=2.0
+
+# ── Cache / state ────────────────────────────────────────────────────────────
+redis>=4.0,<6.0
+
+# ── LLM API ──────────────────────────────────────────────────────────────────
+openai>=1.0,<2.0
+
+# ── XML parsing (Maven pom.xml) ───────────────────────────────────────────────
+lxml>=4.9
+
+# ── Tokenizer (token budget enforcement) ────────────────────────────────────
+tiktoken>=0.5
+
+# ── Retry / resilience ───────────────────────────────────────────────────────
+tenacity>=8.0,<10.0
+
+# ── Git repository mirroring ─────────────────────────────────────────────────
+gitpython>=3.1
+
+# ── YAML config parsing ──────────────────────────────────────────────────────
+pyyaml>=6.0
+
+# ── CLI framework ────────────────────────────────────────────────────────────
+click>=8.0
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+pytest>=7.0
+pytest-timeout>=2.0

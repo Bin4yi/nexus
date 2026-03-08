@@ -9,6 +9,7 @@ Java configuration manager classes via ``[:READS_CONFIG]`` edges.
 from __future__ import annotations
 import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -114,6 +115,13 @@ class ConfigurationParser:
                 if "target" not in str(cf) and "test" not in str(cf).lower():
                     configs.extend(self._parse_xml_config(cf, repo_name, seen_keys))
 
+        # 4. *.properties files (WSO2 config files)
+        for props_pattern in ["src/main/resources", "repository/conf", "conf"]:
+            props_dir = repo_path / props_pattern
+            if props_dir.exists():
+                for props_file in props_dir.glob("*.properties"):
+                    configs.extend(self._scan_properties_file(props_file, repo_name, seen_keys))
+
         # 3. application.yml / application.yaml
         for yml_file in self._find_files(repo_path, "application.yml"):
             configs.extend(self._parse_yaml_config(yml_file, repo_name, seen_keys))
@@ -206,8 +214,22 @@ class ConfigurationParser:
     def _parse_toml(
         self, toml_file: Path, repo_name: str, seen: set[str],
     ) -> list[ConfigurationInfo]:
-        """Parse a deployment.toml file for section headers and key-value pairs."""
+        """Parse a deployment.toml file using tomllib (stdlib, Python 3.11+) for
+        accurate hierarchy. Falls back to regex-based parsing for older Python."""
         configs: list[ConfigurationInfo] = []
+
+        # Use tomllib (stdlib 3.11+) for accurate nested table handling
+        if sys.version_info >= (3, 11):
+            try:
+                import tomllib
+                with open(toml_file, "rb") as f:
+                    data = tomllib.load(f)
+                self._flatten_toml_dict(data, "", toml_file, repo_name, seen, configs)
+                return configs
+            except Exception as e:
+                logger.debug("tomllib parse failed for %s (%s), falling back to regex", toml_file, e)
+
+        # Regex fallback for Python < 3.11 or malformed TOML
         try:
             content = toml_file.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
@@ -219,7 +241,6 @@ class ConfigurationParser:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-
             section_m = _TOML_SECTION_RE.match(line)
             if section_m:
                 current_section = section_m.group(1)
@@ -227,25 +248,78 @@ class ConfigurationParser:
                 if key not in seen:
                     seen.add(key)
                     configs.append(ConfigurationInfo(
-                        config_key=key,
-                        config_type="toml",
-                        source_file=str(toml_file),
-                        repo_name=repo_name,
+                        config_key=key, config_type="toml",
+                        source_file=str(toml_file), repo_name=repo_name,
                     ))
                 continue
-
             kv_m = _TOML_KV_RE.match(line)
             if kv_m and current_section:
                 full_key = f"{current_section}.{kv_m.group(1)}"
                 if full_key not in seen:
                     seen.add(full_key)
                     configs.append(ConfigurationInfo(
-                        config_key=full_key,
-                        config_type="toml",
-                        source_file=str(toml_file),
-                        repo_name=repo_name,
+                        config_key=full_key, config_type="toml",
+                        source_file=str(toml_file), repo_name=repo_name,
+                    ))
+        return configs
+
+    def _flatten_toml_dict(
+        self, data: dict, prefix: str, source_file: Path,
+        repo_name: str, seen: set[str], configs: list[ConfigurationInfo],
+    ) -> None:
+        """Recursively flatten a tomllib dict into dotted config keys."""
+        for k, v in data.items():
+            full_key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                # Nested table — record the section and recurse
+                section_key = f"[{full_key}]"
+                if section_key not in seen:
+                    seen.add(section_key)
+                    configs.append(ConfigurationInfo(
+                        config_key=section_key, config_type="toml",
+                        source_file=str(source_file), repo_name=repo_name,
+                    ))
+                self._flatten_toml_dict(v, full_key, source_file, repo_name, seen, configs)
+            elif isinstance(v, list) and v and isinstance(v[0], dict):
+                # Array of tables [[section]]
+                for i, item in enumerate(v):
+                    self._flatten_toml_dict(item, full_key, source_file, repo_name, seen, configs)
+            else:
+                # Leaf value — record as dotted key
+                if full_key not in seen:
+                    seen.add(full_key)
+                    configs.append(ConfigurationInfo(
+                        config_key=full_key, config_type="toml",
+                        source_file=str(source_file), repo_name=repo_name,
                     ))
 
+    def _scan_properties_file(
+        self, props_file: Path, repo_name: str, seen: set[str],
+    ) -> list[ConfigurationInfo]:
+        """Parse Java *.properties files for key=value entries."""
+        configs: list[ConfigurationInfo] = []
+        try:
+            content = props_file.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("Cannot read %s: %s", props_file, e)
+            return configs
+
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            # key=value or key: value
+            m = re.match(r'^([\w.\-/]+)\s*[=:]', line)
+            if m:
+                key = m.group(1).strip()
+                if key not in seen:
+                    seen.add(key)
+                    configs.append(ConfigurationInfo(
+                        config_key=key,
+                        config_type="properties",
+                        source_file=str(props_file),
+                        repo_name=repo_name,
+                    ))
         return configs
 
     def _parse_xml_config(

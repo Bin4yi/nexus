@@ -20,6 +20,8 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT event_class_fqn IF NOT EXISTS FOR (n:EventClass) REQUIRE n.fqn IS UNIQUE",
     "CREATE CONSTRAINT db_table_name IF NOT EXISTS FOR (n:DatabaseTable) REQUIRE n.name IS UNIQUE",
     "CREATE CONSTRAINT config_key IF NOT EXISTS FOR (n:Configuration) REQUIRE n.config_key IS UNIQUE",
+    # v2: RFC specification nodes
+    "CREATE CONSTRAINT spec_id IF NOT EXISTS FOR (s:Specification) REQUIRE s.spec_id IS UNIQUE",
 ]
 
 INDEXES = [
@@ -37,6 +39,12 @@ INDEXES = [
     # DatabaseTable and Configuration indexes
     "CREATE INDEX dbtable_repo IF NOT EXISTS FOR (n:DatabaseTable) ON (n.repo_name)",
     "CREATE INDEX config_type IF NOT EXISTS FOR (n:Configuration) ON (n.config_type)",
+    # v2: visibility/modifier indexes for security analysis queries
+    "CREATE INDEX logicunit_visibility IF NOT EXISTS FOR (n:LogicUnit) ON (n.visibility)",
+    "CREATE INDEX component_visibility IF NOT EXISTS FOR (n:Component) ON (n.visibility)",
+    "CREATE INDEX logicunit_lifecycle IF NOT EXISTS FOR (n:LogicUnit) ON (n.lifecycle_role)",
+    # v2: specification index
+    "CREATE INDEX spec_rfc IF NOT EXISTS FOR (s:Specification) ON (s.rfc)",
 ]
 
 # Fulltext index — separate because syntax differs (not via CREATE INDEX)

@@ -1,19 +1,27 @@
 # CodeNexus — Autonomous Multi-Agent CI/CD Graph Pipeline
-## Project Proposal (Phase 01: Knowledge Base Engine)
+## Project Proposal (v2: High-Fidelity WSO2-IS Knowledge Graph)
 
-> **Document Version**: 1.0  
-> **Date**: February 27, 2026  
-> **Phase**: 01 — Deterministic GraphRAG & Java Codebase Indexing
+> **Document Version**: 2.0
+> **Last Updated**: March 2026
+> **Phase**: v1 Complete + v2 Sprint 1 Complete + v2 Sprint 2-4 Planned
 
 ---
 
 ## 1. Executive Summary
 
-In massive enterprise ecosystems spanning 100+ repositories, **no single developer understands the entire system**. Standard AI coding tools rely on chat interfaces and probabilistic text chunking — destroying code structure and hallucinating dependencies.
+In massive enterprise ecosystems spanning 100+ repositories, **no single developer understands
+the entire system**. Standard AI coding tools rely on chat interfaces and probabilistic text
+chunking — destroying code structure and hallucinating dependencies.
 
-**CodeNexus** is a **headless, autonomous multi-agent system** that lives transparently inside the CI/CD pipeline. It is built on a massive, **Deterministic Knowledge Base (GraphRAG)** that compiles raw source code into a Neo4j Knowledge Graph and ChromaDB Vector Store — creating a "Digital Twin" of the entire codebase.
+**CodeNexus** is a **headless, deterministic GraphRAG knowledge base** that compiles raw Java
+source code into a Neo4j Knowledge Graph and ChromaDB Vector Store — creating a "Digital Twin"
+of the entire codebase.
 
-**Phase 01** focuses exclusively on building this foundational Knowledge Base Engine — the "World Model" that enables future autonomous agents to navigate code with **mathematical certainty**.
+**Phase 01** built the foundational Knowledge Base Engine. **Phase 02** added end-to-end
+execution flow extraction and the Microsoft GraphRAG global rollup. **v2** improves parser
+accuracy for WSO2 Identity Server — the primary target codebase — adding method visibility,
+structured annotation values, JAX-RS path composition, OSGi lifecycle detection, and accurate
+TOML configuration parsing.
 
 ---
 
@@ -22,12 +30,12 @@ In massive enterprise ecosystems spanning 100+ repositories, **no single develop
 ### The Context Blindness Crisis
 
 | Problem | Impact |
-|---------|--------|
+|---|---|
 | **Fragmented Knowledge** | No developer holds a complete mental model of 100+ repos |
 | **Probabilistic RAG Failures** | Text-chunking destroys inheritance hierarchies and call graphs |
 | **Dependency Hallucination** | Standard LLMs guess how code connects instead of tracing actual paths |
 | **Cross-Repo Blindness** | Changes in Repo A silently break Repo C through transitive dependencies |
-| **Onboarding Bottleneck** | New engineers take months to understand the architectural topology |
+| **WSO2-IS Specifics** | v1 missed ~40% of WSO2-IS architecture: method visibility invisible, annotations unparsed, JAX-RS paths broken, OSGi lifecycle unmapped |
 
 ### Why Existing Tools Fail
 
@@ -44,7 +52,6 @@ graph LR
         F <-->|GEID Bridge| G
         F -->|Graph Traversal| H[Mathematically Proven Paths]
     end
-
     style D fill:#ff4444,color:#fff
     style H fill:#44bb44,color:#fff
 ```
@@ -53,179 +60,215 @@ graph LR
 
 ## 3. Project Vision
 
-### The Full CodeNexus Pipeline (All Phases)
+### The Full CodeNexus Pipeline
 
 ```mermaid
 graph TB
-    subgraph "Phase 01 — Knowledge Base Engine 🎯"
+    subgraph "Phase 01/02 — Knowledge Base Engine ✅"
         P1[AST Parser<br/>Tree-sitter] --> P2[Neo4j Graph<br/>Structural Truth]
         P1 --> P3[ChromaDB<br/>Semantic Intent]
         P2 <-->|GEID Bridge| P3
     end
 
-    subgraph "Phase 02 — Agent Swarm"
+    subgraph "v2 — WSO2-IS Accuracy ✅ Sprint 1"
+        V1[Visibility & Modifiers] --> P2
+        V2[Annotation Dicts] --> P2
+        V3[JAX-RS Path Composition] --> P2
+        V4[OSGi Lifecycle] --> P2
+    end
+
+    subgraph "v2 Sprint 2 — RFC Specs"
+        R1[RFC Fetcher<br/>14 IETF RFCs] --> P2
+        R2[Citation Scanner] --> P2
+        R3[IMPLEMENTS_SPEC edges] --> P2
+    end
+
+    subgraph "v2 Sprint 3 — MCP Server"
+        M1[query_codebase] --> P2
+        M1 --> P3
+        M2[blast_radius] --> P2
+    end
+
+    subgraph "Phase 02+ — Agent Swarm"
         A1[Architect Agent<br/>Blast Radius] --> A2[Security Agent<br/>CVE Audit]
         A2 --> A3[Refactor Agent<br/>Code Fixes]
     end
 
-    subgraph "Phase 03 — CI/CD Integration"
-        C1[GitHub Webhooks] --> C2[Go Ingress Gateway]
-        C2 --> C3[Autonomous PR Review]
-    end
-
     P2 --> A1
     P3 --> A2
-    A3 --> C3
-
-    style P1 fill:#6366f1,color:#fff
-    style P2 fill:#6366f1,color:#fff
-    style P3 fill:#6366f1,color:#fff
 ```
-
-> [!IMPORTANT]
-> Phase 01 is the **foundation** — without a reliable Knowledge Base, the autonomous agents in later phases would hallucinate and produce unreliable results.
 
 ---
 
-## 4. Phase 01 Scope & Objectives
+## 4. Current Status
 
-### In-Scope
+### ✅ Completed
 
-| # | Objective | Deliverable |
-|---|-----------|-------------|
-| 1 | **Java AST Parsing** | Tree-sitter parser for Java producing UIR (classes, methods, interfaces) |
-| 2 | **Javadoc & Documentation Parsing** | Extract and index Javadoc comments, annotations, and inline documentation |
-| 3 | **Multi-Repo Dependency Graph** | Neo4j graph: inheritance, call graphs, Maven module deps |
-| 4 | **Semantic Intent Search** | ChromaDB: functional chunking + Javadoc intent indexing |
-| 5 | **Bi-Directional Linkage** | GEID bridge connecting graph nodes ↔ vector embeddings |
-| 6 | **Cross-Repo Linker** | `pom.xml` Maven resolver + REST API endpoint detection |
-| 7 | **Ingestion Pipeline** | 4-stage Data Factory with CLI validation |
+| Component | Status | Notes |
+|---|---|---|
+| Java AST Parser (Tree-sitter) | ✅ Complete | UIR: Project → Module → Component → LogicUnit |
+| Neo4j Schema + Loader | ✅ Complete | 16 relationship types, 14 indexes, APOC batch |
+| ChromaDB Embedder + Chunker | ✅ Complete | `code_logic` + `code_intent` collections, 384-dim |
+| Maven Dependency Resolver | ✅ Complete | pom.xml → DEPENDS_ON edges |
+| REST API Bridge | ✅ Complete | Spring + JAX-RS (with v2 path composition) |
+| Ingestion Pipeline | ✅ Complete | Mirror → Extract → Link → Load → Post |
+| Leiden Community Detection | ✅ Complete | Dynamic GDS projection, resilient to partial ingests |
+| Community Summarisation | ✅ Complete | Fast model (gpt-4o-mini), ThreadPoolExecutor |
+| SQL Schema Parser | ✅ Complete | DatabaseTable nodes + QUERIES_TABLE edges |
+| Config Parser | ✅ Complete | tomllib, XML, properties, YAML |
+| EntryPoint / DataSink Tagger | ✅ Complete | Spring + JAX-RS + Servlet patterns |
+| GDS Dijkstra Flow Extractor | ✅ Complete | API→DB shortest paths |
+| Flow Narrative Summariser | ✅ Complete | Fast model, flow_narratives collection |
+| Global GraphRAG Rollup | ✅ Complete | L2 (fast) + L3 (strong), 11 domains |
+| Three-Tier Query Router | ✅ Complete | Routes A/B/C/D, 100% deterministic for A/B/D |
+| Map Step | ✅ Complete | 0-LLM question mode + LLM PR mode |
+| Reduce Step | ✅ Complete | Strong model, 6 intents, intent-adaptive tokens |
+| Two-Tier LLM Strategy | ✅ Complete | `llm_fast_model` + `llm_strong_model` in settings |
+| **v2 Method Visibility/Modifiers** | ✅ Complete | visibility, is_static, is_abstract, is_final, is_synchronized |
+| **v2 Annotation Dicts** | ✅ Complete | `list[dict]` with name + value fields |
+| **v2 Parameter Annotations** | ✅ Complete | @QueryParam, @PathVariable on parameters |
+| **v2 Generic Type Preservation** | ✅ Complete | `List<User>` preserved in type fields |
+| **v2 Lambda Call Extraction** | ✅ Complete | Recursion into lambda/stream bodies |
+| **v2 JAX-RS Path Composition** | ✅ Complete | Class @Path + method @Path merged |
+| **v2 OSGi Lifecycle** | ✅ Complete | @Activate/@Deactivate/@Modified → lifecycle_role |
+| **v2 tomllib Config Parser** | ✅ Complete | Accurate nested TOML tables |
+| **v2 Properties Files** | ✅ Complete | *.properties → Configuration nodes |
 
-### Explicitly Out-of-Scope (Phase 02+)
+### Planned
 
-- LLM-powered autonomous agents
-- GitHub webhook integration
-- Automated PR commenting
-- Redis short-term agent memory
-- CI/CD pipeline deployment
+| Sprint | Focus | Target |
+|---|---|---|
+| Sprint 2 | RFC Specification Knowledge Base | IETF RFC nodes + IMPLEMENTS_SPEC edges |
+| Sprint 3 | MCP Server | Cursor/Claude Desktop integration |
+| Sprint 4 | Query intelligence + performance | Re-ranking, query expansion, multiprocessing |
 
 ---
 
 ## 5. Technology Stack
 
 | Layer | Technology | Justification |
-|-------|-----------|--------------|
-| **AST Parsing** | Tree-sitter (Python bindings) + `tree-sitter-java` | Incremental parsing, error-resilient, full Java grammar support |
-| **Graph Database** | Neo4j 5.x + APOC | Industry-standard property graph, Cypher query language, bulk loading |
-| **Vector Database** | ChromaDB | Lightweight, Python-native, metadata filtering, easy deployment |
-| **Embeddings** | HuggingFace `all-MiniLM-L6-v2` | Fast CPU inference, 384-dim, excellent for code+NL tasks |
-| **Orchestration** | Python 3.11+ | Rich ecosystem for all three stores, type hints, async support |
-| **Build File Parsing** | `lxml` (XML) | Robust Maven POM/`pom.xml` dependency parsing |
-| **Javadoc Parsing** | Tree-sitter block comments + regex | Extracts `@param`, `@return`, `@throws` tags from Javadoc |
-| **Infrastructure** | Docker Compose | Single-command deployment of all microservices |
-| **Git Integration** | GitPython | Programmatic clone/pull for repository mirroring |
+|---|---|---|
+| **AST Parsing** | Tree-sitter + `tree-sitter-java` | Incremental, error-resilient, full Java grammar |
+| **Graph Database** | Neo4j 5.x + APOC + GDS | Property graph, Cypher, bulk loading, Leiden, Dijkstra |
+| **Vector Database** | ChromaDB | Lightweight, Python-native, 6 collections |
+| **Embeddings** | `all-MiniLM-L6-v2` | CPU-only, 384-dim, no API key |
+| **LLM (bulk)** | OpenAI `gpt-4o-mini` | 90% cost saving vs gpt-4o for bulk ops |
+| **LLM (quality)** | OpenAI `gpt-4o` | Best quality for final user-facing answers |
+| **Cache/State** | Redis | Pipeline stage tracking |
+| **Build Parsing** | `lxml` | Robust Maven pom.xml parsing |
+| **Config Parsing** | `tomllib` (Python 3.11+) | Accurate TOML nested tables |
+| **Infrastructure** | Docker Compose | One-command deployment |
+| **Git Integration** | GitPython | Programmatic clone/pull |
+| **Retry** | tenacity | Resilient against transient failures |
+| **Token Budget** | tiktoken | Enforce 8K context ceiling |
+| **IDE Integration** | MCP (Sprint 3) | Cursor + Claude Desktop tools |
 
 ---
 
 ## 6. Key Innovations
 
 ### 6.1 Deterministic Over Probabilistic
-Unlike standard RAG that guesses how code connects, CodeNexus **compiles** dependencies into graph edges. A query like "What breaks if I change `UserService.getUser()`?" returns a **mathematically proven** blast radius — not an LLM guess.
+
+Unlike standard RAG that guesses how code connects, CodeNexus **compiles** dependencies into
+graph edges. "What breaks if I change `UserService.getUser()`?" returns a **mathematically
+proven** blast radius — not an LLM guess.
 
 ### 6.2 The GEID Bridge
-Every entity in the system (class, method, function) receives a **Global Entity Identifier** — a deterministic hash of `repo_name::fully_qualified_name`. This single ID appears in both Neo4j nodes and ChromaDB metadata, enabling seamless jumps between structural and semantic queries.
+
+Every entity receives a `SHA256(repo::fqn)[:16]` GEID. This appears in both Neo4j nodes and
+ChromaDB metadata — enabling seamless jumps between structural and semantic queries.
 
 ### 6.3 Functional Chunking
-Standard RAG chunks code by character count (500-1000 chars), destroying function boundaries. CodeNexus chunks by **LogicUnit** — each function/method is one atomic chunk. Comments and docstrings are embedded separately for natural language intent search.
 
-### 6.4 Javadoc-Aware Semantic Search
-Unlike standard code search, CodeNexus separately embeds Javadoc comments (`@param`, `@return`, `@throws`, description blocks) into a dedicated ChromaDB `code_intent` collection. This means a search for "validate JWT tokens" directly finds the `TokenValidator.validate()` method — even if the function body never mentions "JWT" directly.
+Standard RAG chunks code by character count, destroying function boundaries. CodeNexus
+chunks by **LogicUnit** — each function/method is one atomic chunk.
+
+### 6.4 High-Fidelity Java Model (v2)
+
+v1 stored methods as names + FQNs. v2 stores the full Java semantic model:
+- **Visibility** + **modifiers**: enables security analysis (`public static` methods, `synchronized` critical sections)
+- **Annotation dicts**: enables config extraction (`@Value("${key}")`), JAX-RS parameter mapping (`@QueryParam("client_id")`), OSGi wiring (`@Reference(cardinality=MANDATORY)`)
+- **OSGi lifecycle**: maps WSO2 component startup/shutdown/reconfiguration
+- **Generic types**: `List<AccessToken>` vs `List<String>` are now distinct
+
+### 6.5 Two-Tier Cost Strategy
+
+90% of LLM operations use `gpt-4o-mini` (community summarisation, map scoring, L2 rollup).
+Only the final user-facing answer uses `gpt-4o` (reduce step, L3 global rollup).
+A full ingest of 100 repos costs ~$0.50 vs ~$5+ if everything used gpt-4o.
+
+### 6.6 Dynamic GDS Projection
+
+The Leiden community detection dynamically detects which relationship types exist in the
+database and projects only those. This prevents pipeline crashes on partial ingests where
+some edge types haven't been populated yet.
 
 ---
 
-## 7. Success Criteria
+## 7. Cost Estimate
 
-| Metric | Target |
-|--------|--------|
-| Java classes correctly parsed to graph nodes | ≥ 95% accuracy |
-| Java interfaces/enums correctly parsed | ≥ 95% accuracy |
-| Javadoc comments extracted and indexed | ≥ 90% coverage |
-| Maven cross-repo dependencies resolved | ≥ 90% of declared deps |
-| Semantic search returns relevant methods | Top-5 recall ≥ 80% |
-| Graph query latency (3-hop traversal) | < 200ms |
-| Full pipeline ingestion (10 Java repos) | < 5 minutes |
-| Zero dangling calls in controlled test set | 100% referential integrity |
+### Per full ingest of 100 repos
+
+| Operation | Model | Est. Calls | Est. Cost |
+|---|---|---|---|
+| Community summarisation (~2000 communities) | gpt-4o-mini (fast) | 2000 | ~$0.40 |
+| Map step LLM scoring (PR mode only) | gpt-4o-mini (fast) | ~200/PR | ~$0.02/PR |
+| L2 domain rollup (~10 domains) | gpt-4o-mini (fast) | 10 | ~$0.01 |
+| L3 global rollup (1 call) | gpt-4o (strong) | 1 | ~$0.05 |
+| Query answers (reduce step) | gpt-4o (strong) | per query | ~$0.01/query |
+| RFC fetching (Sprint 2) | network only | 14 RFCs | free after cache |
+| Re-ingest (unchanged files) | — | 0 (cached, Sprint 4) | **$0** |
+| Cross-encoder re-ranking (Sprint 4) | local CPU | — | **$0** |
+
+**Estimated total**: ~$0.50 per 100-repo ingest (vs ~$5+ without two-tier strategy).
 
 ---
 
-## 8. Risk Assessment
+## 8. Success Criteria
+
+| Metric | Target | Status |
+|---|---|---|
+| Java classes correctly parsed | ≥ 95% | ✅ Achieved |
+| Method visibility extracted | 100% for tree-sitter-parsed methods | ✅ v2 Sprint 1 |
+| Annotation structured format | All annotations as list[dict] | ✅ v2 Sprint 1 |
+| JAX-RS effective paths | Class + method path merged | ✅ v2 Sprint 1 |
+| OSGi lifecycle detected | @Activate/@Deactivate/@Modified | ✅ v2 Sprint 1 |
+| Config key accuracy | Nested TOML tables correct | ✅ v2 Sprint 1 |
+| Zero-LLM question mode | Map step: 0 LLM calls | ✅ Achieved |
+| Graph query latency (3-hop) | < 200ms | ✅ Achieved |
+| RFC compliance queries (Sprint 2) | Answer cites actual RFC text | Planned |
+| MCP tool response (Sprint 3) | < 3 seconds for blast_radius | Planned |
+| Re-ingest cost (Sprint 4) | ~$0 for unchanged communities | Planned |
+
+---
+
+## 9. Risk Assessment
 
 | Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| Tree-sitter Java grammar gaps for edge-case syntax | Medium | Medium | Fallback to regex extraction for unsupported constructs |
-| Neo4j memory pressure at scale (1M+ nodes) | Low | High | APOC batch loading, index tuning, pagination |
-| Incomplete Javadoc extraction (missing tags) | Medium | Low | Regex fallback for malformed Javadoc blocks |
+|---|---|---|---|
+| Tree-sitter Java grammar gaps | Medium | Medium | Fallback to regex for unsupported constructs |
+| Neo4j memory at scale (1M+ nodes) | Low | High | APOC batch loading, index tuning |
+| OpenAI rate limits | Medium | Low | `SUMMARIZER_MAX_WORKERS` cap, fast model reduces volume |
 | GEID collisions | Very Low | High | SHA-256 with 16-char truncation (2^64 namespace) |
-| Docker resource constraints on dev machines | Medium | Low | Configurable memory limits, lightweight ChromaDB |
+| Docker resource constraints | Medium | Low | Configurable memory limits |
+| tomllib Python version requirement | Low | Low | Regex fallback already implemented |
 
 ---
 
-## 9. Hackathon Judging Criteria Alignment
+## 10. Deliverables Summary
 
-| Criterion | Status | How We Satisfy It |
-|-----------|--------|-------------------|
-| **Multi-Agent System** | ✅ Planned (Phase 02) | Architect, Security, Refactor agents on LangGraph |
-| **Minimum 6 Nodes** | ✅ Designed | Go Ingress, Go State, Java Parser, 3x Python Agents |
-| **3 External APIs** | ✅ Designed | GitHub, Snyk/SonarQube, LLM Inference |
-| **Memory Layer** | ✅ **Built in Phase 01** | Redis (short-term), ChromaDB + Neo4j (long-term) |
-| **Deployment Plan** | ✅ **Built in Phase 01** | Docker Compose MVP → Kubernetes prod |
-| **No Chatbots** | ✅ Core Design | 100% headless CI/CD pipeline |
-
----
-
-## 10. Timeline (Phase 01)
-
-```mermaid
-gantt
-    title CodeNexus Phase 01 Timeline
-    dateFormat  YYYY-MM-DD
-    axisFormat  %b %d
-
-    section Infrastructure
-    Docker Compose & Config       :infra, 2026-02-27, 1d
-    Project Scaffolding           :scaffold, after infra, 1d
-
-    section Java AST Parser
-    Java Tree-sitter Parser       :java, after scaffold, 2d
-    Javadoc & Annotation Parser   :javadoc, after java, 1d
-    UIR Model & FQN Extraction    :uir, after scaffold, 1d
-
-    section Knowledge Stores
-    Neo4j Schema & Constraints    :neo4j, after uir, 1d
-    Neo4j Bulk Loader             :loader, after neo4j, 2d
-    ChromaDB Embedder & Chunker   :chroma, after uir, 2d
-
-    section Cross-Repo Linker
-    Dependency Resolver           :deps, after loader, 1d
-    API Bridge Detection          :bridge, after deps, 1d
-
-    section Pipeline & Verification
-    Ingestion Pipeline            :pipe, after bridge, 2d
-    CLI & Validation Suite        :cli, after pipe, 1d
-    Integration Testing           :test, after cli, 1d
-```
-
----
-
-## 11. Deliverables Summary
-
-| # | Deliverable | Format |
-|---|-------------|--------|
-| 1 | Running Dockerized Knowledge Base | `docker-compose.yml` |
-| 2 | Java AST & Javadoc Parser | Python package (`parsers/`) |
-| 3 | Neo4j Graph with GEID constraints | Cypher schema + Python loader |
-| 4 | ChromaDB Semantic Collections | Python embedder + chunker |
-| 5 | Cross-Repo Linker | Python package (`linker/`) |
-| 6 | Ingestion Pipeline CLI | Click-based CLI (`pipeline/cli.py`) |
-| 7 | Validation & Test Suite | `pytest` + CLI commands |
-| 8 | Project Documentation | Proposal + Architecture + Implementation Plan |
+| # | Deliverable | Status |
+|---|---|---|
+| 1 | Running Dockerized Knowledge Base | ✅ `docker-compose.yml` |
+| 2 | High-fidelity Java AST Parser | ✅ `parsers/java_parser.py` (v2) |
+| 3 | Neo4j Graph (16 edge types, visibility, lifecycle) | ✅ `graph/` |
+| 4 | ChromaDB Semantic Collections (6) | ✅ `vectorstore/` |
+| 5 | Cross-Repo Linker (Maven + REST + JAX-RS) | ✅ `linker/` |
+| 6 | Configuration Parser (TOML + XML + Properties + YAML) | ✅ `parsers/config_parser.py` |
+| 7 | Two-Tier LLM Strategy | ✅ `config/settings.py` |
+| 8 | GraphRAG Query Pipeline (4 routes, 6 intents) | ✅ `reasoning/` |
+| 9 | Ingestion Pipeline CLI | ✅ `pipeline/cli.py` |
+| 10 | RFC Specification Knowledge Base | ⏳ Sprint 2 |
+| 11 | MCP Server (Cursor/Claude Desktop) | ⏳ Sprint 3 |
+| 12 | Query Expansion + Re-Ranking | ⏳ Sprint 4 |
+| 13 | Comprehensive Documentation | ✅ `docs/` (v2) |

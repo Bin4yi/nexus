@@ -1183,6 +1183,38 @@ def cmd_debug(error_input: str, context_lines: int = 10) -> None:
     print(f"{'━' * 72}\n")
 
 
+# ── interactive REPL ──────────────────────────────────────────────────────────
+
+def cmd_interactive(candidates: int = 20, threshold: int = 70,
+                    depth: int = 3, repo: str | None = None):
+    """Interactive query REPL — type questions continuously, Ctrl+C or 'exit' to quit."""
+    banner = """
+╔══════════════════════════════════════════════════════════════════╗
+║          CodeNexus — Interactive Query Mode                      ║
+║  Type a question and press Enter.  'exit' or Ctrl+C to quit.    ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+    print(banner)
+    while True:
+        try:
+            question = input("  nexus> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n\n  Goodbye.\n")
+            break
+        if not question:
+            continue
+        if question.lower() in ("exit", "quit", "q", ":q"):
+            print("\n  Goodbye.\n")
+            break
+        try:
+            query(question, candidates=candidates, threshold=threshold,
+                  depth=depth, repo=repo)
+        except KeyboardInterrupt:
+            print("\n  (interrupted — press Ctrl+C again or type 'exit' to quit)\n")
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n  [error] {exc}\n")
+
+
 # ── argparse ──────────────────────────────────────────────────────────────────
 
 def main():
@@ -1193,6 +1225,7 @@ def main():
 Commands:
   ingest                  Ingest repositories into the knowledge base
   query   <question>      Ask a free-form question (semantic + graph reasoning)
+  interactive             Start an interactive REPL (alias: chat)
   explain <name>          Explain what a method/class does (with source + callers)
   trace   <name>          Show full call chain above and below a method
   callers <name>          List every method that calls this one
@@ -1200,13 +1233,14 @@ Commands:
   debug   <error>         Root-cause analysis from an exception or stack trace
 
 Examples:
+  python main.py interactive
+  python main.py query   "is impersonation supported without an actor token"
   python main.py explain validateActorToken
   python main.py trace   TokenExchangeGrantHandler --depth 2
   python main.py callers isImpersonationRequest --code
   python main.py find    "throw new OAuthSystemException"
   python main.py debug   NullPointerException
   python main.py debug   "$(cat trace.txt)"
-  python main.py query   "is impersonation supported without an actor token"
 """,
     )
     sub = parser.add_subparsers(dest="command")
@@ -1254,6 +1288,15 @@ Examples:
     dp.add_argument("--context", type=int, default=10, dest="context_lines",
                     help="Lines of context around each relevant line (default 10)")
 
+    # interactive / chat
+    ip = sub.add_parser("interactive", aliases=["chat"],
+                        help="Start an interactive REPL to ask questions continuously")
+    ip.add_argument("--candidates", type=int, default=20)
+    ip.add_argument("--threshold",  type=int, default=70)
+    ip.add_argument("--depth",      type=int, default=3)
+    ip.add_argument("--repo",       type=str, default=None,
+                    help="Scope all queries to a specific repository by name")
+
     args = parser.parse_args()
 
     if args.command == "ingest":
@@ -1271,6 +1314,9 @@ Examples:
         cmd_find(args.term, context_lines=args.context_lines, max_hits=args.max_hits)
     elif args.command == "debug":
         cmd_debug(args.error, context_lines=args.context_lines)
+    elif args.command in ("interactive", "chat"):
+        cmd_interactive(candidates=args.candidates, threshold=args.threshold,
+                        depth=args.depth, repo=args.repo)
     else:
         parser.print_help()
         sys.exit(1)

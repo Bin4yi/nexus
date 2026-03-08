@@ -7,6 +7,7 @@ to prevent Neo4j lazy-execution silent drops.
 All batch sizes are read from ``config.settings`` â€” no hard-coded magic numbers.
 """
 from __future__ import annotations
+import json
 import logging
 from typing import Any
 from neo4j import Driver
@@ -281,12 +282,12 @@ class Neo4jLoader:
 
         for comp in all_components:
             for ann in comp.annotations:
-                ann_name = ann.lstrip("@").split("(")[0].strip()
+                ann_name = ann.get("name", "") if isinstance(ann, dict) else ann.lstrip("@").split("(")[0].strip()
                 if ann_name:
                     comp_pairs.append({"src_geid": comp.geid, "ann_name": ann_name})
             for lu in comp.logic_units:
                 for ann in lu.annotations:
-                    ann_name = ann.lstrip("@").split("(")[0].strip()
+                    ann_name = ann.get("name", "") if isinstance(ann, dict) else ann.lstrip("@").split("(")[0].strip()
                     if ann_name and ann_name != "Override":
                         lu_pairs.append({"lu_geid": lu.geid, "ann_name": ann_name})
 
@@ -563,7 +564,10 @@ class Neo4jLoader:
                 c.start_line = $start_line, c.end_line = $end_line,
                 c.docstring = $docstring,
                 c.annotations = $annotations,
-                c.is_event_handler = $is_event_handler
+                c.is_event_handler = $is_event_handler,
+                c.visibility = $visibility,
+                c.is_abstract = $is_abstract,
+                c.is_final = $is_final
             WITH c
             MATCH (m:Module {geid: $module_geid})
             MERGE (m)-[:DECLARES]->(c)
@@ -571,8 +575,11 @@ class Neo4jLoader:
             geid=comp.geid, name=short_name, fqn=comp.fqn, kind=comp.kind,
             file_path=comp.file_path, start_line=comp.start_line,
             end_line=comp.end_line, docstring=comp.docstring,
-            annotations=comp.annotations,
+            annotations=json.dumps(comp.annotations),
             is_event_handler=comp.is_event_handler,
+            visibility=comp.visibility,
+            is_abstract=comp.is_abstract,
+            is_final=comp.is_final,
             module_geid=module_geid,
         ).consume()
         for lu in comp.logic_units:
@@ -594,7 +601,13 @@ class Neo4jLoader:
                 l.annotations = $annotations,
                 l.deprecated = $deprecated,
                 l.throws = $throws,
-                l.overrides = $overrides
+                l.overrides = $overrides,
+                l.visibility = $visibility,
+                l.is_static = $is_static,
+                l.is_abstract = $is_abstract,
+                l.is_final = $is_final,
+                l.is_synchronized = $is_synchronized,
+                l.lifecycle_role = $lifecycle_role
             WITH l
             MATCH (c:Component {geid: $comp_geid})
             MERGE (c)-[:HAS_METHOD]->(l)
@@ -603,7 +616,13 @@ class Neo4jLoader:
             return_type=lu.return_type or "",
             file_path=lu.file_path, start_line=lu.start_line,
             end_line=lu.end_line, docstring=lu.docstring,
-            annotations=lu.annotations, deprecated=lu.deprecated,
+            annotations=json.dumps(lu.annotations), deprecated=lu.deprecated,
             throws=lu.throws, overrides=lu.overrides or "",
+            visibility=lu.visibility,
+            is_static=lu.is_static,
+            is_abstract=lu.is_abstract,
+            is_final=lu.is_final,
+            is_synchronized=lu.is_synchronized,
+            lifecycle_role=lu.lifecycle_role or "",
             comp_geid=comp_geid,
         ).consume()

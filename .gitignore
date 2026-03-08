@@ -4,52 +4,87 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.dylib
+*.dll
 *.egg
 *.egg-info/
 dist/
 build/
 *.spec
+MANIFEST
+wheels/
+sdist/
+develop-eggs/
+downloads/
+parts/
+var/
 
-# ── Virtual environments ────────────────────────────────────────────────────────
+# ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
 venv/
 env/
+ENV/
 .env.bak
+# Embedded venv created by `py -m ensurepip` in project root
+Lib/
+Scripts/
+Include/
+DLLs/
+tcl/
+pyvenv.cfg
 
-# ── Environment / secrets ──────────────────────────────────────────────────────
+# ── Environment / secrets ─────────────────────────────────────────────────────
 # Keep .env.example but never commit the real .env (contains API keys)
 .env
 !.env.example
+*.key
+*.pem
+secrets.yaml
+secrets.json
 
 # ── IDE / editor ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+*.code-workspace
+*.suo
+*.user
 *.swp
 *.swo
 *~
-.DS_Store
-Thumbs.db
 
-# ── Test & coverage ────────────────────────────────────────────────────────────
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── Test & coverage ───────────────────────────────────────────────────────────
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 *.xml
 junit*.xml
+test-results/
+
+# ── Type checkers & linters ───────────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyright/
+pyrightconfig.json
 
 # ── Logs & output ─────────────────────────────────────────────────────────────
 *.log
+*.log.*
 output.txt
 output_act.txt
 logs/
-
-# ── Mirror (cloned repos — large, not part of the tool source) ────────────────
-mirror/
-
-# ── Docker volumes (if bind-mounted locally) ──────────────────────────────────
-neo4j_data/
-chroma_data/
-redis_data/
 
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
@@ -59,12 +94,45 @@ redis_data/
 *.pyi
 py.typed
 
-# ── MyPy / Pyright caches ─────────────────────────────────────────────────────
-.mypy_cache/
-.pyright/
-pyrightconfig.json
-
 # ── Packaging / distribution ──────────────────────────────────────────────────
 *.whl
 *.tar.gz
-MANIFEST
+*.zip
+
+# ── Repository mirrors (large, re-cloneable on demand) ───────────────────────
+mirror/
+mirrors/
+
+# ── Docker volumes (if bind-mounted locally) ──────────────────────────────────
+neo4j_data/
+neo4j_logs/
+chroma_data/
+chroma/
+redis_data/
+dump.rdb
+volumes/
+
+# ── RFC text cache (re-fetchable from rfc-editor.org) ────────────────────────
+cache/
+*.cache
+data/rfcs/
+
+# ── Write-ahead log (incremental updater) ────────────────────────────────────
+wal.json
+
+# ── ML model weights (large binaries, downloaded at runtime) ─────────────────
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+sentence_transformers/
+models/
+.cache/huggingface/
+.cache/torch/
+
+# ── Lock file (auto-generated, use requirements.txt instead) ─────────────────
+requirements-lock.txt
+
+# ── MyPy / Pyright caches ─────────────────────────────────────────────────────
+.mypy_cache/

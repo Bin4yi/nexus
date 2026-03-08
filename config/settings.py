@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     llm_provider: str = Field(default="openai")
     llm_model: str = Field(default="gpt-4o-mini")
     llm_api_key: str = Field(default="")
+    # Two-tier model strategy: fast (bulk/cheap) vs strong (final answers)
+    llm_fast_model: str = Field(
+        default="gpt-4o-mini",
+        description="Model for bulk ops: community summarization, map scoring, query expansion.",
+    )
+    llm_strong_model: str = Field(
+        default="gpt-4o",
+        description="Model for intelligence: final reduce answer, L3 global rollup only.",
+    )
     # Azure OpenAI settings (used when llm_provider="azure")
     llm_azure_endpoint: str = Field(
         default="",
@@ -178,8 +187,12 @@ class Settings(BaseSettings):
     def neo4j_auth(self) -> tuple[str, str]:
         return (self.neo4j_user, self.neo4j_password)
 
-    def make_llm_client(self):
+    def make_llm_client(self, tier: str = "fast"):
         """Return an OpenAI or AzureOpenAI client based on llm_provider.
+
+        Args:
+            tier: "fast" (gpt-4o-mini for bulk ops) or "strong" (gpt-4o for final answers).
+                  Ignored for Azure (deployment name controls model there).
 
         Use this factory everywhere instead of instantiating OpenAI() directly
         so that switching between standard OpenAI and Azure requires only a
@@ -192,7 +205,6 @@ class Settings(BaseSettings):
                     "Set LLM_AZURE_ENDPOINT in your .env file."
                 )
             from openai import AzureOpenAI
-            deployment = self.llm_deployment or self.llm_model
             return AzureOpenAI(
                 api_key=self.llm_api_key,
                 azure_endpoint=self.llm_azure_endpoint,
@@ -200,6 +212,10 @@ class Settings(BaseSettings):
             )
         from openai import OpenAI
         return OpenAI(api_key=self.llm_api_key)
+
+    def get_model_name(self, tier: str = "fast") -> str:
+        """Return the model name for the given tier ("fast" or "strong")."""
+        return self.llm_strong_model if tier == "strong" else self.llm_fast_model
 
 
 # Singleton — import this everywhere

@@ -1,20 +1,20 @@
-# CodeNexus Phase 01 — Architecture Diagram Explained
+# CodeNexus — Architecture Diagram Explained
 
-> **Document Version**: 1.0  
-> **Date**: February 27, 2026  
-> **Purpose**: A plain-English walkthrough of every component in the Phase 01 system architecture diagram
+> **Document Version**: 2.0
+> **Last Updated**: March 2026
+> **Purpose**: A plain-English walkthrough of every component in the system architecture
 
 ---
 
-## The Diagram
+## The Full Pipeline Diagram
 
 ```mermaid
 flowchart TB
     subgraph SRC ["☕  Java Repository Layer"]
         direction LR
-        R1[("Repo 1\nuser-service")]
-        R2[("Repo 2\nauth-service")]
-        R3[("Repo 3\nshared-lib")]
+        R1[("Repo 1\nidentity-oauth")]
+        R2[("Repo 2\ntoken-exchange")]
+        R3[("Repo 3\nidentity-core")]
         RN[("Repo N\n...")]
     end
 
@@ -29,48 +29,72 @@ flowchart TB
         TS["Tree-sitter\ntree-sitter-java"]
         AST["Concrete\nSyntax Tree"]
         JDP["Javadoc Parser\n@param @return @throws"]
+        MOD["Modifier Extractor\nvisibility · static · abstract"]
+        ANN["Annotation Parser\n{name: Value, value: ${key}}"]
+        OSG["OSGi Lifecycle\n@Activate @Deactivate"]
         FQN["FQN Builder\npkg · class · method"]
         UIR["UIR Objects\nProject › Module › Component › LogicUnit"]
         GEID["GEID Generator\nsha256(repo::fqn)[:16]"]
         TS --> AST --> FQN
         AST --> JDP --> FQN
+        AST --> MOD --> UIR
+        AST --> ANN --> UIR
+        AST --> OSG --> UIR
         FQN --> UIR --> GEID
     end
 
     subgraph ST3 ["🔗  Stage 3 · Link"]
         MVN["Maven Resolver\npom.xml parser"]
-        API["API Bridge\n@RequestMapping detector"]
+        API["API Bridge\n@RequestMapping · @Path\nclass path + method path"]
         DEPS["DEPENDS_ON edges\nModule → Module"]
         RCALLS["REMOTE_CALLS edges\nLogicUnit → LogicUnit"]
+        CFG2["Config Parser\ntomllib · XML · properties · YAML"]
         MVN --> DEPS
         API --> RCALLS
     end
 
     subgraph ST4 ["📦  Stage 4 · Load"]
-        NLOAD["Neo4j Bulk Loader\nAPOC periodic.iterate"]
-        CEMB["ChromaDB Embedder\nall-MiniLM-L6-v2"]
+        NLOAD["Neo4j Bulk Loader\nAPOC periodic.iterate\nvisibility · lifecycle · annotations(JSON)"]
+        CEMB["ChromaDB Embedder\nall-MiniLM-L6-v2 (384-dim)"]
+    end
+
+    subgraph ST5 ["⚙️  Stage 5 · Post-Processing"]
+        LEIDEN["Leiden Algorithm\nGDS community detection"]
+        SUM["Community Summariser\ngpt-4o-mini (fast model)"]
+        TAG["NodeTagger\n:EntryPoint · :DataSink"]
+        FLOW["Flow Extractor\nGDS Dijkstra paths"]
+        FSUM["Flow Summariser\ngpt-4o-mini stories"]
+        ROLL["Global Rollup\nL2 (fast) + L3 (strong)"]
+        LEIDEN --> SUM --> TAG --> FLOW --> FSUM --> ROLL
     end
 
     subgraph KB ["🗄️  Knowledge Base  (Tri-Store)"]
-        NEO[("🔷 Neo4j\nStructural Graph")]
-        CHR[("🟣 ChromaDB\nSemantic Vectors")]
+        NEO[("🔷 Neo4j\nStructural Graph\n16 edge types\nvisibility · lifecycle")]
+        CHR[("🟣 ChromaDB\nSemantic Vectors\n6 collections")]
         RED[("🔴 Redis\nPipeline State")]
         NEO <-->|"GEID Bridge"| CHR
     end
 
     subgraph QI ["🖥️  Query Interface"]
-        CLI["⌨️ CLI"]
-        CYP["📊 Cypher"]
-        SEM["🔍 Semantic Search"]
+        CLI["⌨️ CLI / main.py"]
+        MCP["🔌 MCP Server\n(Sprint 3)"]
+        ROUTER["Router\nA·B·C·D"]
+        REDUCE["Reduce Step\ngpt-4o (strong model)"]
     end
 
-    SRC --> ST1 --> ST2 --> ST3 --> ST4
-    ST2 -->|"UIR objects"| ST4
+    SRC --> ST1 --> ST2 --> ST3 --> ST4 --> ST5
+    ST2 -.->|"UIR"| ST4
+    ST3 -.->|"ConfigInfo"| ST4
     ST4 --> NEO & CHR
     ST4 -.-> RED
-    NEO --> CYP
-    CHR --> SEM
+    ST5 --> NEO & CHR
+
     CLI -->|triggers| ST1
+    CLI -->|query| ROUTER
+    MCP -->|tools| ROUTER
+    ROUTER --> REDUCE
+    REDUCE <-->|inference| CHR
+    REDUCE <-->|graph walks| NEO
 ```
 
 ---
@@ -81,21 +105,9 @@ flowchart TB
 
 ### ☕ Java Repository Layer — "The Input"
 
-```
-R1: Repo 1 (user-service)
-R2: Repo 2 (auth-service)
-R3: Repo 3 (shared-lib)
-RN: Repo N  (...)
-```
-
-**What it is:**  
-These are your actual Java microservices and libraries hosted on GitHub, GitLab, or any Git server. They are the **raw input** to the system. Nothing has been analyzed yet at this point.
-
-**Why multiple repos:**  
-Enterprise systems don't live in one repo. `user-service` might call `auth-service`, which uses classes from `shared-lib`. Understanding how they connect is the whole point of Phase 01.
-
-**What does NOT happen here:**  
-The system does not scan GitHub live. It pulls a local copy first (Stage 1). This ensures the pipeline runs on a stable snapshot.
+These are your actual Java microservices hosted on GitHub or GitLab. Nothing has been
+analyzed yet at this point. The system does not scan GitHub live — it pulls a local copy
+first (Stage 1) to ensure a stable snapshot.
 
 ---
 
@@ -105,477 +117,352 @@ The system does not scan GitHub live. It pulls a local copy first (Stage 1). Thi
 repos.yaml → GitPython (Clone/Pull) → Local Volume ./mirror/
 ```
 
-**What it is:**  
-The Mirror stage creates and maintains a **local copy of every repository** on disk.
-
-**Components:**
-
 | Component | What it does |
-|-----------|-------------|
-| `repos.yaml` | A manifest file listing every repo URL, branch, and name to index |
-| `GitPython` | Python library that runs `git clone` (first time) or `git pull` (subsequent runs) |
-| `Local Volume ./mirror/` | The disk location where all repos are stored: `./mirror/user-service/`, `./mirror/auth-service/` etc. |
+|---|---|
+| `repos.yaml` | Manifest listing every repo URL, branch, and name |
+| `GitPython` | Runs `git clone` (first time) or `git pull` (subsequent) |
+| `./mirror/` | Local disk location: `./mirror/identity-oauth/`, `./mirror/token-exchange/`, etc. |
 
-**Example repos.yaml:**
-```yaml
-repositories:
-  - name: user-service
-    url: https://github.com/org/user-service
-    branch: main
-  - name: auth-service
-    url: https://github.com/org/auth-service
-    branch: main
-  - name: shared-lib
-    url: https://github.com/org/shared-lib
-    branch: main
-```
-
-**Key design choice:** Shallow clones (`depth=1`) are used for speed. Only the latest commit snapshot is needed — full git history is irrelevant for code indexing.
-
-**Output of this stage:** All `.java` files from all repos are now accessible locally.
+**Output:** All `.java` files from all repos accessible locally.
 
 ---
 
 ### 🔬 Stage 2 — Extract: "Understand the Code"
 
-```
-Tree-sitter → AST → FQN Builder
-                ↘
-             Javadoc Parser → FQN Builder → UIR Objects → GEID
-```
-
-This is the most complex stage. It has **two parallel parsing paths** that both feed into the FQN Builder.
+This is the most complex stage. Multiple extraction passes run on the same Tree-sitter AST.
 
 ---
 
 #### Component: Tree-sitter (`tree-sitter-java`)
 
-**What it is:** A fast, error-tolerant parser that reads raw `.java` source files and converts them into a **Concrete Syntax Tree (CST/AST)** — a precise tree structure representing every token and construct in the file.
+Reads raw `.java` source files → **Concrete Syntax Tree (CST/AST)** representing every
+token and construct.
 
-**What it extracts from the tree:**
-- Class declarations
-- Interface declarations
-- Method declarations
-- Method invocations (who calls who)
-- Import statements
-- Package declarations
-- Annotations (`@Override`, `@RequestMapping`, etc.)
+**v2 Sprint 1 extracts additionally:**
 
-**Example:**  
-For this Java code:
-```java
-package com.example.auth;
+| Extraction | What it finds | UIR field |
+|---|---|---|
+| `modifiers` child node | `public`, `private`, `static`, `abstract`, `final`, `synchronized` | `visibility`, `is_static`, etc. |
+| `marker_annotation` / `annotation` nodes | Structured annotation dicts: `{"name": "Value", "value": "${key}"}` | `annotations: list[dict]` |
+| `formal_parameter` annotations | `@QueryParam("client_id")`, `@PathVariable` | `Parameter.annotations` |
+| OSGi annotations | `@Activate`, `@Deactivate`, `@Modified` | `lifecycle_role` |
+| `lambda_expression` bodies | Calls inside `.stream().filter(x -> x.method())` | `calls[]` (previously invisible) |
+| `generic_type` nodes | `List<User>`, `Map<String, Object>` | Preserved in `type_name` |
 
-public class UserService {
-    public User getUser(Long id) {
-        return userRepo.findById(id);
-    }
-}
+**Example Tree-sitter extraction for a public static method:**
 ```
-Tree-sitter produces a structured tree like:
-```
-(compilation_unit
-  (package_declaration "com.example.auth")
-  (class_declaration
-    name: (identifier) "UserService"
-    body: (class_body
-      (method_declaration
-        type: (type_identifier) "User"
-        name: (identifier) "getUser"
-        parameters: (formal_parameters
-          (formal_parameter type: "Long" name: "id"))
-        body: (block
-          (return_statement
-            (method_invocation
-              object: "userRepo"
-              name: "findById")))))))
+(method_declaration
+  (modifiers "public" "static")              ← visibility="public", is_static=True
+  type: (type_identifier) "List"
+  name: (identifier) "getTokens"
+  parameters: (formal_parameters
+    (formal_parameter
+      (marker_annotation name: "QueryParam") ← annotations=[{"name":"QueryParam","value":"type"}]
+      type: "String"
+      name: "type"))
+  body: ...)
 ```
 
 ---
 
 #### Component: Javadoc Parser
 
-**What it is:** A secondary parser that runs on the **same AST** but looks specifically for `/** ... */` block comments immediately before class and method declarations.
-
-**What it extracts:**
+Runs on the same AST, looks for `/** ... */` blocks before class/method declarations.
 
 | Tag | Example | Stored As |
-|-----|---------|-----------|
-| Description | `/** Retrieves a user by ID */` | `LogicUnit.docstring` |
-| `@param` | `@param id The user's unique identifier` | `Parameter.doc` |
-| `@return` | `@return The matching User object` | `LogicUnit.return_doc` |
-| `@throws` | `@throws NotFoundException if user not found` | `LogicUnit.throws_doc[]` |
-| `@see` | `@see UserRepository#findById` | Cross-reference hint |
-| `@deprecated` | `@deprecated Use getUserById instead` | `LogicUnit.deprecated = true` |
+|---|---|---|
+| Description | `/** Retrieves tokens by type */` | `LogicUnit.docstring` |
+| `@param` | `@param type The token type filter` | `Parameter.doc` |
+| `@return` | `@return List of matching access tokens` | `LogicUnit.return_doc` |
+| `@throws` | `@throws OAuthSystemException if invalid type` | `LogicUnit.throws_doc[]` |
 
-**Why this matters:**  
-The docstring is stored separately from the code body. This allows ChromaDB to create two different vectors:
-1. One for **what the code does** (body text)
-2. One for **what the developer intended** (Javadoc)
+---
 
-This enables natural language queries like *"where is the user lookup logic?"* — which finds the method through its Javadoc even if the word "lookup" never appears in the code.
+#### Component: Annotation Parser (`_parse_annotation`)
+
+**New in v2 Sprint 1.** Converts tree-sitter annotation nodes into structured dicts instead
+of raw strings.
+
+| Annotation Java | Old format | New format |
+|---|---|---|
+| `@Override` | `"@Override"` | `{"name": "Override"}` |
+| `@Value("${key}")` | `'@Value("${key}")'` | `{"name": "Value", "value": "${key}"}` |
+| `@QueryParam("id")` | `'@QueryParam("id")'` | `{"name": "QueryParam", "value": "id"}` |
+| `@Reference(cardinality=MANDATORY)` | `'@Reference(...)'` | `{"name": "Reference", "cardinality": "MANDATORY"}` |
+
+This enables specific queries:
+- "Find all public endpoints that accept `client_id` as a query parameter"
+- "Find all OSGi @Reference dependencies with MANDATORY cardinality"
+- "Find all Spring @Value injections reading the `oauth.token.lifetime` config key"
+
+---
+
+#### Component: OSGi Lifecycle Detector
+
+**New in v2 Sprint 1.** Detects WSO2/OSGi lifecycle methods:
+
+| Annotation | `lifecycle_role` set to |
+|---|---|
+| `@Activate` | `"activate"` |
+| `@Deactivate` | `"deactivate"` |
+| `@Modified` | `"modified"` |
+
+Enables: `MATCH (n:LogicUnit {lifecycle_role: 'activate'}) RETURN n.fqn` to find all
+OSGi component initialisation methods.
 
 ---
 
 #### Component: FQN Builder — "The Address Builder"
 
-**What it is:** Takes the class name, package name, and method name from the AST and combines them into a **Fully Qualified Name (FQN)** — the globally unique address of every entity in the codebase.
+Combines package + class + method name into a globally unique Fully Qualified Name:
 
-**How FQN is built:**
 ```
-Package:   com.example.auth
-Class:     UserService
-Method:    getUser
-──────────────────────────────
-FQN:       com.example.auth.UserService.getUser
+Package:   com.wso2.carbon.identity.oauth2
+Class:     OAuth2Service
+Method:    getAccessToken
+──────────────────────────────────────────────────────
+FQN:       com.wso2.carbon.identity.oauth2.OAuth2Service.getAccessToken
 ```
 
-**Why FQN is necessary:**  
-Without it, 100 repos might all have a class named `UserService`. FQN makes every entity globally unique across all repositories.
-
-| Short name | Problem | FQN | Unique? |
-|------------|---------|-----|---------|
-| `getUser` | 47 repos have this | `com.example.auth.UserService.getUser` | ✅ Yes |
-| `UserService` | 23 repos have this | `com.example.auth.UserService` | ✅ Yes |
+Without FQN, 100 repos might all have a class named `OAuth2Service`. FQN makes every entity
+globally unique across all repositories.
 
 ---
 
 #### Component: UIR Objects — "The Structured Summary"
 
-**What it is:** The UIR (Universal Intermediate Representation) is a clean Python data object that represents every parsed entity. It is the **output format of Stage 2** and the **input format for Stage 3 and Stage 4**.
+The UIR (Universal Intermediate Representation) is the output of Stage 2 and the input for
+Stages 3 and 4. All parsed information flows through these Pydantic models.
 
-**UIR hierarchy:**
+**v2 UIR hierarchy:**
 ```
 Project
  └── Module (Maven artifact = one pom.xml)
       └── Component (Java class or interface)
+           │  fields: visibility, is_abstract, is_final, annotations: list[dict]
            └── LogicUnit (method or constructor)
+                    fields: visibility, is_static, is_abstract, is_final,
+                            is_synchronized, lifecycle_role,
+                            annotations: list[dict]
+                            parameters: [Parameter(annotations: list[dict])]
 ```
-
-**Example UIR for `UserService.getUser()`:**
-```json
-{
-  "geid": "e7d2c8a1f3b50942",
-  "fqn": "com.example.auth.UserService.getUser",
-  "kind": "method",
-  "parameters": [
-    { "name": "id", "type_name": "Long" }
-  ],
-  "return_type": "User",
-  "body_text": "return userRepo.findById(id).orElseThrow(...);",
-  "docstring": "Retrieves a user by their unique ID.",
-  "return_doc": "The matching User object",
-  "calls": [
-    "com.example.repo.UserRepository.findById"
-  ],
-  "file_path": "src/main/java/com/example/auth/UserService.java",
-  "start_line": 8,
-  "end_line": 10
-}
-```
-
-**What is NOT stored:** The complete file. Only the metadata about the method is kept.
 
 ---
 
 #### Component: GEID Generator — "The Universal Key"
 
-**What it is:** A deterministic function that converts an FQN into a short, unique 16-character identifier used as the primary key in both Neo4j and ChromaDB.
-
-**Formula:**
 ```python
 geid = sha256(f"{repo_name}::{fqn}")[:16]
-# Example:
-geid = sha256("user-service::com.example.auth.UserService.getUser")[:16]
-# Result: "e7d2c8a1f3b50942"
+# "identity-oauth::com.wso2.carbon.identity.oauth2.OAuth2Service.getAccessToken"
+# → "a3f7b2c91e804d6a"
 ```
 
-**Why not just use the FQN directly as a key?**
-
-| | FQN as key | GEID as key |
-|--|------------|-------------|
-| Length | 50–80 chars | 16 chars always |
-| DB index speed | Slower | Fast |
-| Consistent across re-runs | ✅ Yes | ✅ Yes |
-| Safe in all DB constraints | Sometimes fails | ✅ Always safe |
-
-**The critical property:** Running the same FQN through this formula always produces the same GEID. So if you re-index the codebase tomorrow, `getUser` gets the same GEID — enabling safe `MERGE` (upsert) operations in Neo4j and ChromaDB.
+The same 16-character GEID appears in both Neo4j nodes and ChromaDB metadata.
+This is the bridge between structural (graph) and semantic (vector) queries.
 
 ---
 
 ### 🔗 Stage 3 — Link: "Connect the Repos"
 
-```
-pom.xml → Maven Resolver → DEPENDS_ON edges
-@RequestMapping → API Bridge → REMOTE_CALLS edges
-```
+#### Maven Resolver
 
-**What it is:** Stage 3 resolves **cross-repository relationships** that Stage 2 couldn't detect (because Stage 2 only looks at one file at a time).
+Parses every `pom.xml` → creates `DEPENDS_ON` edges between Maven modules.
 
----
-
-#### Component: Maven Resolver
-
-**What it is:** Parses every `pom.xml` file in every repo and creates **DEPENDS_ON** graph edges between Maven modules.
-
-**Example:**  
-`user-service/pom.xml` contains:
 ```xml
+<!-- identity-oauth/pom.xml -->
 <dependency>
-    <groupId>com.example</groupId>
-    <artifactId>shared-lib</artifactId>
-    <version>2.1.0</version>
+    <groupId>org.wso2.carbon.identity</groupId>
+    <artifactId>identity-core</artifactId>
 </dependency>
 ```
 
-Maven Resolver:
-1. Reads this dependency declaration
-2. Looks up `shared-lib` in the module registry (built from all indexed repos)
-3. Creates the edge: `(user-service) -[:DEPENDS_ON {scope:"compile", version:"2.1.0"}]-> (shared-lib)`
+→ `(identity-oauth:Module)-[:DEPENDS_ON]->(identity-core:Module)`
 
-This means the graph now knows that if `shared-lib` changes a public API, `user-service` is potentially broken.
+#### API Bridge Detector
 
----
+**v2 Sprint 1 improvement:** Now correctly handles JAX-RS class-level + method-level path composition.
 
-#### Component: API Bridge Detector
-
-**What it is:** Detects when one Java service makes an HTTP call to an endpoint defined in another Java service, and records this as a `REMOTE_CALLS` relationship.
-
-**Two-pass process:**
-
-**Pass 1 — Register endpoints** (scan all Java files for Spring annotations):
+**Old behavior (v1):** Only extracted the method-level `@Path`:
 ```java
-@RestController
-public class UserController {
-    @GetMapping("/api/users/{id}")      ← REGISTERED: GET /api/users/{id}
-    public User getUser(@PathVariable Long id) { ... }
+@Path("/oauth2")              // class-level — was IGNORED
+public class OAuth2Endpoint {
+    @GET
+    @Path("/token")           // method-level — was the ONLY path registered
+    public Response getToken() { ... }
 }
+// v1 registered path: "/token"  ← WRONG
 ```
 
-**Pass 2 — Detect calls** (scan for RestTemplate/FeignClient/WebClient usage):
-```java
-// In OrderService:
-User user = restTemplate.getForObject(
-    "http://user-svc/api/users/" + userId, User.class
-);                  ← DETECTED: GET /api/users/{id}
+**New behavior (v2):** Merges class + method paths:
+```
+effective_path = normalize("/oauth2" + "/" + "/token")
+             = "/oauth2/token"    ← CORRECT
 ```
 
-**Matching:**  
-`/api/users/{id}` == `/api/users/{id}` → match found!
+Now also extracts `@Consumes(MediaType.APPLICATION_FORM_URLENCODED)` and
+`@Produces(MediaType.APPLICATION_JSON)` into the endpoint registration.
 
-**Edge created:**
-```
-(OrderService.placeOrder) -[:REMOTE_CALLS {
-    protocol: "REST",
-    method: "GET",
-    path: "/api/users/{id}"
-}]-> (UserController.getUser)
+#### Configuration Parser
+
+**v2 Sprint 1 addition:** `*.properties` files now supported.
+**v2 improvement:** `deployment.toml` now uses `tomllib` (Python 3.11+ stdlib) for
+accurate nested table handling instead of regex.
+
+Before (v1 regex):
+```toml
+[transport.https]              # was read as section "[transport.https]"
+port = 9443                    # but nested tables were lost or mislabeled
 ```
 
-**Why this matters:**  
-Now the graph knows that `OrderService` depends on `UserController.getUser()` at runtime — even though there's no compile-time import linking them. This is cross-service blast radius detection.
+After (v2 tomllib):
+```python
+data = tomllib.load(f)
+# data = {"transport": {"https": {"port": 9443}}}
+# → config_key = "transport.https.port"  ← correct
+```
 
 ---
 
 ### 📦 Stage 4 — Load: "Write to the Knowledge Base"
 
-```
-Neo4j Bulk Loader ──→ Neo4j
-ChromaDB Embedder ──→ ChromaDB
-                 ··→ Redis (state)
-```
+#### Neo4j Bulk Loader (v2 additions)
 
-**What it is:** Takes all UIR objects from Stage 2 and all edges from Stage 3, and persists them into the permanent knowledge stores.
-
----
-
-#### Component: Neo4j Bulk Loader (APOC periodic.iterate)
-
-**What it is:** Writes all nodes and relationships into Neo4j using APOC's batch processing to handle millions of records without running out of memory.
-
-**Three sub-phases:**
-
-**Phase 1 — Nodes** (idempotent upsert):
+**New properties on LogicUnit nodes:**
 ```cypher
-UNWIND $batch AS item
 MERGE (n:LogicUnit {geid: item.geid})
 SET n.fqn = item.fqn,
-    n.kind = item.kind,
-    n.file_path = item.file_path,
-    n.start_line = item.start_line,
-    n.end_line = item.end_line
-```
-`MERGE` = create if not exists, update if exists. Safe to re-run.
-
-**Phase 2 — Hierarchy edges:**
-```cypher
--- Component → LogicUnit
-MATCH (c:Component {geid: $comp_geid})
-MATCH (l:LogicUnit {geid: $lu_geid})
-MERGE (c)-[:HAS_METHOD]->(l)
+    n.visibility = item.visibility,          -- "public"/"private"/"protected"/"package"
+    n.is_static = item.is_static,            -- true/false
+    n.is_abstract = item.is_abstract,
+    n.is_final = item.is_final,
+    n.is_synchronized = item.is_synchronized,
+    n.lifecycle_role = item.lifecycle_role,  -- "activate"/"deactivate"/"modified"/""
+    n.annotations = item.annotations         -- JSON string: '[{"name":"Value","value":"${key}"}]'
 ```
 
-**Phase 3 — Call graph edges** (APOC batch):
-```cypher
-CALL apoc.periodic.iterate(
-  'MATCH (a:LogicUnit) WHERE size(a._calls_fqn) > 0 RETURN a',
-  'UNWIND a._calls_fqn AS target_fqn
-   MATCH (b:LogicUnit {fqn: target_fqn})
-   MERGE (a)-[:CALLS]->(b)',
-  {batchSize: 500}
-)
-```
+**Annotation storage:** `list[dict]` → `json.dumps()` → stored as JSON string in Neo4j property.
+Query with APOC: `apoc.convert.fromJsonList(n.annotations)`.
+
+#### ChromaDB Embedder
+
+Two collections with 384-dimensional vectors (unchanged from v1):
+- `code_logic` — method body text → "Find code that does X"
+- `code_intent` — Javadoc text → "Find code intended for X"
 
 ---
 
-#### Component: ChromaDB Embedder (all-MiniLM-L6-v2)
+### ⚙️ Stage 5 — Post-Processing
 
-**What it is:** Converts method bodies and Javadoc text into mathematical vectors and stores them in ChromaDB for semantic search.
-
-**Two collections created:**
-
-| Collection | Input text | Purpose |
-|------------|-----------|---------|
-| `code_logic` | Full method body | "Find code that does X" |
-| `code_intent` | Javadoc description | "Find code that means X" |
-
-**Embedding process:**
 ```
-"Retrieves a user by their unique ID."
-         ↓  (all-MiniLM-L6-v2 model)
-[0.023, -0.147, 0.891, 0.034, ... ]   ← 384 numbers
-         ↓
-Stored in ChromaDB with metadata:
-{
-  "geid": "e7d2c8a1f3b50942",
-  "fqn": "com.example.auth.UserService.getUser",
-  "chunk_type": "intent_chunk",
-  "language": "java",
-  "file_path": "...",
-  "start_line": 8
-}
+Leiden (GDS) → Community summaries (fast model) → EntryPoint/DataSink tagging
+→ Flow extraction (GDS Dijkstra) → Flow narratives (fast model)
+→ Global rollup: L2 (fast model) + L3 (strong model)
 ```
 
-The model converts natural language (or code) into numbers that capture **meaning** — similar concepts end up near each other in this 384-dimensional space.
+All LLM calls in Stage 5 use the **fast model** (gpt-4o-mini) except the L3 Global
+Architecture Document which uses the **strong model** (gpt-4o) for maximum quality.
 
 ---
 
 ### 🗄️ Knowledge Base — "The Tri-Store"
 
-The three permanent storage systems that power the knowledge base:
-
----
-
 #### 🔷 Neo4j — Structural Graph
 
-**What it stores:**  
-The complete structural map of all Java code as a property graph:
+Now stores the full semantic model for every Java entity:
 
-```
-Nodes:         Project, Module, Component, LogicUnit
-Relationships: CALLS, IMPLEMENTS, EXTENDS, DEPENDS_ON, REMOTE_CALLS
-```
-
-**Example graph for user-service:**
 ```
 (user-service:Project)
-    └─[:CONTAINS]→ (user.auth:Module)
-         └─[:DECLARES]→ (UserService:Component)
-              └─[:HAS_METHOD]→ (getUser:LogicUnit)
-                   └─[:CALLS]→ (UserRepository.findById:LogicUnit)
-
-(UserService)-[:IMPLEMENTS]→ (IUserService:Component)
-(user-service)-[:DEPENDS_ON]→ (shared-lib:Module)
+    └─[:CONTAINS]→ (identity.oauth:Module)
+         └─[:DECLARES]→ (OAuth2Service:Component {visibility:"public", is_abstract:false})
+              └─[:HAS_METHOD]→ (getToken:LogicUnit {
+                    visibility: "public",
+                    is_static: false,
+                    lifecycle_role: null,
+                    annotations: '[{"name":"GET"},{"name":"Path","value":"/token"}]'
+                })
+                   └─[:CALLS]→ (TokenIssuer.issue:LogicUnit)
 ```
 
-**What you can query:**
+**New security queries enabled by v2:**
 ```cypher
--- "What breaks if getUser() changes?"
-MATCH (changed:LogicUnit {fqn:"com.example.auth.UserService.getUser"})
-      <-[:CALLS*1..5]-(caller:LogicUnit)
-RETURN caller.fqn, caller.file_path
+-- All public methods with @Value config injection (potential config exposure)
+MATCH (n:LogicUnit {visibility: "public"})
+WHERE n.annotations CONTAINS '"name": "Value"'
+RETURN n.fqn LIMIT 20
 
--- "What does user-service depend on?"
-MATCH path = (m:Module {name:"user-service"})-[:DEPENDS_ON*1..3]->(dep)
-RETURN path
+-- All OSGi activation methods
+MATCH (n:LogicUnit {lifecycle_role: "activate"}) RETURN n.fqn
 
--- "Who implements IUserService?"
-MATCH (c:Component)-[:IMPLEMENTS]->(:Component {fqn:"com.example.IUserService"})
-RETURN c.fqn
+-- All synchronized methods (concurrency-critical code)
+MATCH (n:LogicUnit {is_synchronized: true}) RETURN n.fqn
+
+-- All abstract methods that must be overridden
+MATCH (c:Component {is_abstract: true})-[:HAS_METHOD]->(n:LogicUnit {is_abstract: true})
+RETURN c.fqn, n.fqn
 ```
-
----
 
 #### 🟣 ChromaDB — Semantic Vectors
 
-**What it stores:**  
-384-dimensional vector embeddings of every method body and Javadoc comment.
-
-**What you can query:**
-```python
-# "Where is the token validation logic?"
-results = collection.query(
-    query_texts=["validate JWT token and check expiry"],
-    n_results=5
-)
-# Returns: TokenValidator.validate(), JwtFilter.doFilter(), etc.
-```
-
-**The result includes the GEID** — so you instantly know which Neo4j node to jump to next.
-
----
+Six collections (unchanged from v1):
+- `code_logic`, `code_intent` — per-method vectors
+- `community_summaries` — Leiden community summaries (fast model)
+- `flow_narratives` — API→DB execution path stories (fast model)
+- `l2_subsystem_summaries` — domain sub-system summaries (fast model)
+- `l3_global_architecture` — single master document (strong model)
 
 #### 🔴 Redis — Pipeline State
 
-**What it stores:**  
-Temporary job state while the pipeline is running:
-```
-{stage: "extract", repo: "auth-service", status: "running", started_at: 1234567890}
-{stage: "load", repo: "user-service", status: "done", duration_ms: 4230}
-```
-
-**What it does NOT do:**  
-Redis is NOT used for permanent storage. It's a scratchpad — cleared after each pipeline run. In Phase 02, it becomes the communication channel between autonomous AI agents.
-
----
+Tracks current pipeline stage (`nexus:pipeline:stage`). Temporary — not used for permanent storage.
 
 #### ↔ The GEID Bridge
 
-The double-headed arrow between Neo4j and ChromaDB represents the most important design feature: **every entity in both stores shares the same 16-character GEID**.
-
 ```
-Semantic search in ChromaDB:
-  "token validation logic" → returns vector → metadata.geid = "e7d2c8a1"
+ChromaDB semantic search:
+  "token validation logic" → vector match → metadata.geid = "a3f7b2c9"
 
 Immediately query Neo4j:
-  MATCH (n {geid: "e7d2c8a1"})<-[:CALLS*1..5]-(caller) RETURN caller
+  MATCH (n {geid: "a3f7b2c9"})<-[:CALLS*1..5]-(caller) RETURN caller.fqn
 
 Result: Every method that transitively calls the token validator
 ```
 
-No join tables. No string matching. Just one GEID.
+No join tables. No string matching. Just one 16-character GEID.
 
 ---
 
-### 🖥️ Query Interface — "How You Use the Knowledge Base"
+### 🖥️ Query Interface
 
-Three ways to interact with the populated knowledge base:
+#### CLI / main.py
 
-| Interface | Command / Usage | Best For |
-|-----------|----------------|----------|
-| **⌨️ CLI** | `nexus ingest`, `nexus validate`, `nexus stats` | Running/managing the pipeline |
-| **📊 Cypher** | Graph pattern queries via Neo4j Browser or API | Structural analysis (blast radius, deps) |
-| **🔍 Semantic Search** | Natural language queries via ChromaDB Python client | Intent-based code discovery |
+```bash
+py main.py ingest                         # triggers Stage 1
+py main.py query "does this support...?"  # triggers Router → Map → Reduce
+py main.py blast_radius TokenValidator    # triggers GraphRetriever (0 LLM calls)
+```
 
-The **CLI** is also the trigger for the entire pipeline — running `nexus ingest` is what kicks off Stage 1.
+#### Four Query Routes
+
+| Route | Trigger | LLM | How |
+|---|---|---|---|
+| **A — Symbolic** | Exact symbol name | 0 | ripgrep → Neo4j FQN lookup |
+| **B — Entity** | Named class/method | 0 | Neo4j MATCH by name |
+| **C — Semantic** | Conceptual question | 1 (strong model) | ChromaDB → Map (0 LLM) → Reduce |
+| **D — Global** | "architecture overview" | 0 | Return pre-computed L3 document |
+
+#### MCP Server (Sprint 3)
+
+Four tools for Cursor / Claude Desktop integration:
+- `query_codebase(question)` — full GraphRAG pipeline
+- `blast_radius(fqn, depth)` — zero LLM, pure graph
+- `audit_spec_compliance(fqn)` — RFC compliance with citation
+- `recall_session(files_touched)` — orientation for dev sessions
 
 ---
 
-## The Complete Data Flow — End to End
+## Complete Data Flow — End to End
 
 ```
-Developer runs:
-  nexus ingest --config repos.yaml
+py main.py ingest
           │
           ▼
 ┌─────────────────────────────────────────────┐
@@ -586,23 +473,47 @@ Developer runs:
                        ▼
 ┌─────────────────────────────────────────────┐
 │ Stage 2: Extract                            │
-│  Tree-sitter → AST → FQN → UIR → GEID      │
-│  Javadoc Parser → docstrings → UIR          │
+│  Tree-sitter → AST                          │
+│  → modifiers (visibility, static, abstract) │
+│  → annotations as structured dicts          │
+│  → OSGi lifecycle roles                     │
+│  → parameter annotations                   │
+│  → generic types preserved                 │
+│  → lambda call extraction                  │
+│  → Javadoc → docstrings                    │
+│  → FQN Builder → UIR → GEID                │
 └──────────┬──────────────────────────────────┘
            │ UIR objects (in memory)
            ▼
 ┌─────────────────────────────────────────────┐
 │ Stage 3: Link                               │
 │  pom.xml → DEPENDS_ON edges                 │
+│  @Path (class) + @Path (method) → effective │
 │  @RequestMapping → REMOTE_CALLS edges       │
+│  deployment.toml (tomllib) → ConfigInfo     │
+│  *.xml, *.properties, *.yml → ConfigInfo    │
 └──────────┬──────────────────────────────────┘
-           │ Enriched UIR + edge definitions
+           │ Enriched UIR + edge definitions + ConfigInfo
            ▼
 ┌─────────────────────────────────────────────┐
 │ Stage 4: Load                               │
-│  Neo4j Bulk Loader → Nodes + Relationships  │
-│  ChromaDB Embedder → Vectors (384-dim)      │
-│  Redis → Job state (transient)              │
+│  Neo4j Bulk Loader → nodes with:            │
+│    visibility, is_static, is_abstract,      │
+│    lifecycle_role, annotations (JSON)       │
+│  Neo4j → 16 relationship type edges         │
+│  ChromaDB Embedder → 384-dim vectors        │
+│  Redis → stage tracking                     │
+└──────────┬──────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────┐
+│ Stage 5: Post-Processing                    │
+│  GDS Leiden → community_id on each node     │
+│  CommunitySummarizer → fast model summaries │
+│  NodeTagger → :EntryPoint / :DataSink       │
+│  FlowExtractor → GDS Dijkstra paths         │
+│  FlowSummarizer → fast model narratives     │
+│  GlobalRollup → L2 (fast) + L3 (strong)    │
 └──────────┬──────────────────────────────────┘
            │
      ┌─────┴──────┐
@@ -613,32 +524,39 @@ Developer runs:
      │            │
      ▼            ▼
   Cypher      Semantic
-  Queries     Search
+  Queries     Search → Router → Reduce (strong model)
 ```
-
-**Total pipeline time for 10 Java repos:** ~3–5 minutes (first full index)  
-**Incremental update (1 repo changed):** ~15–30 seconds
 
 ---
 
 ## Summary Table
 
-| Component | Layer | Technology | Stores | Purpose |
-|-----------|-------|-----------|--------|---------|
+| Component | Stage | Technology | Stores | Purpose |
+|---|---|---|---|---|
 | `repos.yaml` | Input | YAML | — | Repo manifest |
 | `GitPython` | Stage 1 | Python | `./mirror/` | Clone/pull repos |
 | `tree-sitter-java` | Stage 2 | C + Python | — | Parse .java → AST |
-| Javadoc Parser | Stage 2 | Python + regex | — | Extract doc comments |
-| FQN Builder | Stage 2 | Python | — | Build unique method addresses |
+| Modifier Extractor | Stage 2 | Python | — | visibility, static, abstract, final |
+| Annotation Parser | Stage 2 | Python | — | Structured `{name, value}` dicts |
+| OSGi Lifecycle Detector | Stage 2 | Python | — | @Activate/@Deactivate/@Modified |
+| Javadoc Parser | Stage 2 | Python + regex | — | @param, @return, @throws |
+| FQN Builder | Stage 2 | Python | — | Unique method addresses |
 | UIR Objects | Stage 2 | Pydantic models | Memory | Structured code summary |
-| GEID Generator | Stage 2 | SHA-256 hash | — | Unique 16-char key |
+| GEID Generator | Stage 2 | SHA-256 hash | — | 16-char cross-DB key |
 | Maven Resolver | Stage 3 | lxml | — | Cross-repo build deps |
-| API Bridge | Stage 3 | Python + regex | — | REST call detection |
-| APOC Loader | Stage 4 | Neo4j APOC | Neo4j | Bulk graph insert |
-| HuggingFace Embedder | Stage 4 | sentence-transformers | ChromaDB | Semantic vector insert |
-| **Neo4j** | Knowledge Base | Graph DB | Permanent | Structural relationships |
-| **ChromaDB** | Knowledge Base | Vector DB | Permanent | Semantic meaning |
-| **Redis** | Knowledge Base | Key-Value | Transient | Pipeline job state |
-| CLI | Query | Click (Python) | — | Pipeline trigger + validation |
-| Cypher | Query | Neo4j query language | — | Structural graph queries |
-| Semantic Search | Query | ChromaDB Python client | — | Natural language code discovery |
+| API Bridge | Stage 3 | Python + regex | — | REST call detection + path composition |
+| Config Parser | Stage 3 | tomllib + regex | — | TOML/XML/properties/YAML |
+| APOC Loader | Stage 4 | Neo4j APOC | Neo4j | Bulk graph insert with new properties |
+| HuggingFace Embedder | Stage 4 | sentence-transformers | ChromaDB | 384-dim vector insert |
+| **Neo4j** | KB | Graph DB | Permanent | Structural relationships + visibility + lifecycle |
+| **ChromaDB** | KB | Vector DB | Permanent | Semantic meaning (6 collections) |
+| **Redis** | KB | Key-Value | Transient | Pipeline stage state |
+| Leiden GDS | Stage 5 | Neo4j GDS | Neo4j | Community detection |
+| CommunitySummarizer | Stage 5 | gpt-4o-mini | ChromaDB | Community summaries |
+| NodeTagger | Stage 5 | Cypher | Neo4j | :EntryPoint / :DataSink labels |
+| FlowExtractor | Stage 5 | Neo4j GDS Dijkstra | — | API→DB paths |
+| FlowSummarizer | Stage 5 | gpt-4o-mini | ChromaDB | Flow narratives |
+| GlobalRollup | Stage 5 | gpt-4o-mini / gpt-4o | ChromaDB | L2/L3 architecture docs |
+| CLI | Query | Click | — | Pipeline trigger |
+| Query Router | Query | Python + regex | — | Route A/B/C/D |
+| Reduce Step | Query | gpt-4o (strong) | — | Final answer synthesis |

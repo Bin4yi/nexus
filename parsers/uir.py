@@ -19,6 +19,7 @@ class Parameter(BaseModel):
     name: str
     type_name: str
     doc: Optional[str] = None           # from @param Javadoc tag
+    annotations: list[dict] = Field(default_factory=list)   # e.g. [{"name": "QueryParam", "value": "client_id"}]
 
 
 class FieldDeclaration(BaseModel):
@@ -45,7 +46,7 @@ class LogicUnit(BaseModel):
     throws_doc: list[str] = Field(default_factory=list)     # @throws tags
     see_refs: list[str] = Field(default_factory=list)       # @see references
     deprecated: bool = False            # @deprecated present
-    annotations: list[str] = Field(default_factory=list)    # e.g. @Override
+    annotations: list[dict] = Field(default_factory=list)   # e.g. [{"name": "Override"}]
     calls: list[str] = Field(default_factory=list)          # FQNs of called methods
     throws: list[str] = Field(default_factory=list)         # exception types in throws clause
     overrides: Optional[str] = None                         # parent method FQN if @Override
@@ -53,6 +54,13 @@ class LogicUnit(BaseModel):
     file_path: str = ""
     start_line: int = 0
     end_line: int = 0
+    # v2: visibility and modifiers (security analysis)
+    visibility: str = "package"         # "public" | "protected" | "private" | "package"
+    is_static: bool = False
+    is_abstract: bool = False
+    is_final: bool = False
+    is_synchronized: bool = False
+    lifecycle_role: Optional[str] = None  # "activate" | "deactivate" | "modified" (OSGi)
 
 
 class Component(BaseModel):
@@ -68,11 +76,15 @@ class Component(BaseModel):
     logic_units: list[LogicUnit] = Field(default_factory=list)
     fields: list[FieldDeclaration] = Field(default_factory=list)   # declared fields
     docstring: str = ""
-    annotations: list[str] = Field(default_factory=list)
+    annotations: list[dict] = Field(default_factory=list)   # e.g. [{"name": "Component"}]
     is_event_handler: bool = False      # extends AbstractEventHandler / implements EventHandler
     file_path: str = ""
     start_line: int = 0
     end_line: int = 0
+    # v2: visibility and modifiers
+    visibility: str = "public"
+    is_abstract: bool = False
+    is_final: bool = False
 
 
 class DependencyEdge(BaseModel):

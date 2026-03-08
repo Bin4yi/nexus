@@ -1,516 +1,482 @@
-# CodeNexus Phase 01 — Implementation Plan
+# CodeNexus — Implementation Plan (v1 + v2)
 
-> **Document Version**: 1.0  
-> **Date**: February 27, 2026  
-> **Scope**: Step-by-step implementation guide for the Knowledge Base Engine
+> **Document Version**: 2.0
+> **Last Updated**: March 2026
+> **Scope**: Comprehensive plan covering Phase 01 (complete), Phase 02 (complete), and v2 Sprint roadmap
 
 ---
 
 ## 1. Overview
 
-This document provides the detailed implementation plan for CodeNexus Phase 01. It specifies every file to be created, the technical approach for each component, and the verification strategy.
+This document tracks every implementation milestone for CodeNexus — from the initial
+Phase 01 Knowledge Base Engine through the v2 accuracy improvements and planned future sprints.
 
-> [!TIP]
-> Refer to [ARCHITECTURE.md](file:///c:/Users/Binulawso2/Desktop/nexus/docs/ARCHITECTURE.md) for system diagrams and [PROJECT_PROPOSAL.md](file:///c:/Users/Binulawso2/Desktop/nexus/docs/PROJECT_PROPOSAL.md) for project context.
+> See [ARCHITECTURE.md](ARCHITECTURE.md) for system diagrams and [PROJECT_PROPOSAL.md](PROJECT_PROPOSAL.md) for project context.
 
 ---
 
-## 2. Proposed Changes
+## 2. Phase 01 — Knowledge Base Engine ✅ Complete
 
-### Component 1: Project Scaffolding & Infrastructure
+### Component 1: Infrastructure & Configuration
 
-#### [NEW] [docker-compose.yml](file:///c:/Users/Binulawso2/Desktop/nexus/docker-compose.yml)
+#### ✅ `docker-compose.yml`
 
-Defines the full infrastructure stack:
+Three-service infrastructure:
 
 | Service | Image | Ports | Purpose |
-|---------|-------|-------|---------|
-| `neo4j` | `neo4j:5.x` + APOC plugin | 7474 / 7687 | Structural graph (long-term memory) |
-| `chromadb` | `chromadb/chroma:latest` | 8000 | Semantic vector store |
-| `redis` | `redis:7-alpine` | 6379 | Short-term agent scratchpad |
+|---|---|---|---|
+| `neo4j` | `neo4j:5.x` + APOC + GDS | 7474 / 7687 | Structural graph + Leiden + Dijkstra |
+| `chromadb` | `ghcr.io/chroma-core/chroma:0.4.15` | 8000 | Semantic vector store |
+| `redis` | `redis:7` | 6379 | Pipeline state |
 
-Key configuration:
-- Neo4j: APOC enabled via `NEO4J_PLUGINS=["apoc"]`, auth configured
-- Persistent named volumes for all three stores
-- Health checks with retry policies
-- Shared Docker network `codenexus`
+Key configuration: APOC + GDS plugins, persistent volumes, health checks, shared `codenexus` network.
 
-#### [NEW] [requirements.txt](file:///c:/Users/Binulawso2/Desktop/nexus/requirements.txt)
+#### ✅ `requirements.txt`
 
-```
-tree-sitter>=0.22.0
-tree-sitter-java>=0.23.0
-neo4j>=5.19.0
-chromadb>=0.5.0
-sentence-transformers>=2.7.0
-redis>=5.0.0
-click>=8.1.0
-pyyaml>=6.0
-lxml>=5.0.0
-gitpython>=3.1.0
-pydantic>=2.7.0
-pydantic-settings>=2.2.0
-pytest>=8.0.0
-python-dotenv>=1.0.0
-```
+All production dependencies with version constraints:
 
-#### [NEW] [settings.py](file:///c:/Users/Binulawso2/Desktop/nexus/config/settings.py)
+| Package | Version | Purpose |
+|---|---|---|
+| `pydantic` | ≥2.0,<3.0 | Data models |
+| `pydantic-settings` | ≥2.0,<3.0 | `.env` loading |
+| `tree-sitter` | ≥0.20 | Java AST parsing |
+| `tree-sitter-java` | ≥0.20 | Java grammar |
+| `neo4j` | ≥5.0,<6.0 | Graph database driver |
+| `chromadb` | ≥0.4.0,<0.6.0 | Vector store client |
+| `sentence-transformers` | ≥2.0 | Local embedding model |
+| `redis` | ≥4.0,<6.0 | State tracking |
+| `openai` | ≥1.0,<2.0 | LLM API (OpenAI + Azure) |
+| `lxml` | ≥4.9 | Maven pom.xml parsing |
+| `tiktoken` | ≥0.5 | Token counting |
+| `tenacity` | ≥8.0,<10.0 | Retry logic |
+| `gitpython` | ≥3.1 | Git clone/pull |
+| `pyyaml` | ≥6.0 | repos.yaml parsing |
+| `click` | ≥8.0 | CLI framework |
+| `pytest` | ≥7.0 | Test runner |
+| `pytest-timeout` | ≥2.0 | Test timeouts |
 
-Pydantic `BaseSettings` class loading from `.env`:
+#### ✅ `config/settings.py`
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection |
-| `NEO4J_USER` | `neo4j` | Auth username |
-| `NEO4J_PASSWORD` | `codenexus` | Auth password |
-| `CHROMA_HOST` | `localhost` | ChromaDB host |
-| `CHROMA_PORT` | `8000` | ChromaDB port |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection |
-| `REPOS_MIRROR_PATH` | `./mirror` | Git clone directory |
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | HuggingFace model |
+Pydantic `BaseSettings` with all operational constants. All modules import the `settings` singleton.
 
 ---
 
-### Component 2: Java AST & Javadoc Parser (Tree-sitter)
+### Component 2: Java AST Parser ✅
 
-#### [NEW] [uir.py](file:///c:/Users/Binulawso2/Desktop/nexus/parsers/uir.py)
+#### ✅ `parsers/uir.py` — Universal Intermediate Representation
 
-Pydantic models defining the **Universal Intermediate Representation**:
+Pydantic models forming the data contract between parsers and all downstream components:
 
-- `Parameter(name, type_name)` — Method/function parameter
-- `LogicUnit(geid, fqn, kind, parameters, return_type, body_text, docstring, calls, file_path, start_line, end_line)` — Single method or function
-- `Component(geid, fqn, kind, implements, extends, logic_units, file_path, start_line)` — Class, interface, enum, or annotation type
-- `Module(geid, name, language, components, dependencies)` — Maven artifact
-- `Project(geid, name, url, branch, modules)` — Single repository
+```
+Project → Module → Component → LogicUnit
+```
+
+| Model | Key Fields |
+|---|---|
+| `Parameter` | `name`, `type_name`, `doc`, `annotations: list[dict]` |
+| `FieldDeclaration` | `name`, `type_name`, `annotations: list[str]`, `is_injected: bool` |
+| `LogicUnit` | `geid`, `fqn`, `kind`, `visibility`, `is_static`, `is_abstract`, `is_final`, `is_synchronized`, `lifecycle_role`, `annotations: list[dict]`, `calls`, `throws`, `overrides`, `instantiates` |
+| `Component` | `geid`, `fqn`, `kind`, `visibility`, `is_abstract`, `is_final`, `annotations: list[dict]`, `implements`, `extends`, `logic_units`, `fields` |
+| `Module` | `geid`, `name`, `components`, `dependencies` |
+| `Project` | `geid`, `name`, `url`, `branch`, `modules` |
 
 GEID generation: `sha256(f"{repo_name}::{fqn}")[:16]`
 
-#### [NEW] [base_parser.py](file:///c:/Users/Binulawso2/Desktop/nexus/parsers/base_parser.py)
+#### ✅ `parsers/java_parser.py` — Java AST Parser (Tree-sitter)
 
-Abstract base class with two methods:
-
-```python
-class BaseParser(ABC):
-    @abstractmethod
-    def parse_file(self, file_path: Path, repo_name: str, package: str) -> list[Component]: ...
-
-    @abstractmethod
-    def parse_project(self, project_root: Path, repo_name: str) -> Project: ...
-```
-
-#### [NEW] [java_parser.py](file:///c:/Users/Binulawso2/Desktop/nexus/parsers/java_parser.py)
-
-**Tree-sitter S-expressions** used for extraction:
-
-| Pattern | Extracts |
-|---------|----------|
-| `(class_declaration name: (identifier) @name)` | Class names → `Component(kind="class")` |
-| `(interface_declaration name: (identifier) @name)` | Interface names → `Component(kind="interface")` |
-| `(method_declaration name: (identifier) @name)` | Method declarations → `LogicUnit(kind="method")` |
-| `(method_invocation name: (identifier) @name)` | Call targets → `LogicUnit.calls[]` |
-| `(superclass (type_identifier) @name)` | Inheritance → `Component.extends` |
-| `(super_interfaces (type_list (type_identifier) @name))` | Implementations → `Component.implements[]` |
-| `(package_declaration (scoped_identifier) @pkg)` | Package name for FQN construction |
-
-Also parses `pom.xml` using `lxml.etree` for:
-- `groupId`, `artifactId`, `version` → Module metadata
-- `<dependency>` elements → `Module.dependencies[]`
-
-#### [NEW] [javadoc_parser.py](file:///c:/Users/Binulawso2/Desktop/nexus/parsers/javadoc_parser.py)
-
-Dedicated parser for extracting structured Javadoc documentation:
-
-| Extraction | Source | Output |
+| Extraction | Tree-sitter pattern | UIR field |
 |---|---|---|
-| Description block | `/** ... */` before methods/classes | `LogicUnit.docstring` or `Component.docstring` |
-| `@param` tags | `@param name description` | Enriches `Parameter` with documentation |
-| `@return` tag | `@return description` | Stored as `LogicUnit.return_doc` |
-| `@throws` / `@exception` | `@throws ExceptionType desc` | Stored as `LogicUnit.throws_doc[]` |
-| `@see` references | `@see OtherClass#method` | Adds potential `[:CALLS]` hints |
-| `@deprecated` | `@deprecated reason` | Stored as `LogicUnit.deprecated` flag |
-| Inline `{@link}` / `{@code}` | Within any Javadoc block | Extracted for cross-reference resolution |
+| Class declarations | `class_declaration name: (identifier)` | `Component(kind="class")` |
+| Interface declarations | `interface_declaration` | `Component(kind="interface")` |
+| Method declarations | `method_declaration` | `LogicUnit(kind="method")` |
+| Modifiers | `modifiers` child node | `visibility`, `is_static`, `is_abstract`, `is_final`, `is_synchronized` |
+| Annotations (structured) | `marker_annotation`, `annotation` → `_parse_annotation()` | `annotations: list[dict]` |
+| Parameter annotations | `annotation` on `formal_parameter` | `Parameter.annotations` |
+| OSGi lifecycle | `@Activate` / `@Deactivate` / `@Modified` | `lifecycle_role` |
+| Method invocations | `method_invocation` + lambda recursion | `calls[]` |
+| Call targets | `method_invocation name:` | `LogicUnit.calls[]` |
+| Inheritance | `superclass (type_identifier)` | `Component.extends` |
+| Implementations | `super_interfaces (type_list)` | `Component.implements[]` |
+| Generic types | `generic_type` nodes | Preserved in `type_name` fields |
 
-Uses Tree-sitter `block_comment` nodes filtered by `/**` prefix, then regex for tag extraction.
+#### ✅ `parsers/javadoc_parser.py`
+
+Extracts `@param`, `@return`, `@throws`, `@see`, `@deprecated` from `/** ... */` blocks.
+Produces `docstring` and `format_for_embedding()` for clean ChromaDB vectors.
 
 ---
 
-### Component 3: Neo4j Graph Schema & Loader
+### Component 3: Neo4j Graph Schema & Loader ✅
 
-#### [NEW] [schema.py](file:///c:/Users/Binulawso2/Desktop/nexus/graph/schema.py)
+#### ✅ `graph/schema.py`
 
-Creates constraints and indexes on startup:
+Creates all constraints and indexes on startup (idempotent via `IF NOT EXISTS`).
 
-```cypher
--- Uniqueness constraints (one per node type)
-CREATE CONSTRAINT project_geid IF NOT EXISTS FOR (p:Project) REQUIRE p.geid IS UNIQUE;
-CREATE CONSTRAINT module_geid IF NOT EXISTS FOR (m:Module) REQUIRE m.geid IS UNIQUE;
-CREATE CONSTRAINT component_geid IF NOT EXISTS FOR (c:Component) REQUIRE c.geid IS UNIQUE;
-CREATE CONSTRAINT logicunit_geid IF NOT EXISTS FOR (l:LogicUnit) REQUIRE l.geid IS UNIQUE;
+Constraints (10): `Project`, `Module`, `Component`, `LogicUnit`, `AnnotationType`,
+`ExceptionType`, `EventClass`, `DatabaseTable`, `Configuration`, `Specification`
 
--- Lookup indexes for cross-referencing
-CREATE INDEX component_fqn IF NOT EXISTS FOR (c:Component) ON (c.fqn);
-CREATE INDEX logicunit_fqn IF NOT EXISTS FOR (l:LogicUnit) ON (l.fqn);
-CREATE INDEX module_name IF NOT EXISTS FOR (m:Module) ON (m.name);
-```
+Indexes (14): FQN lookups, community queries, return type, event handler, kind filtering,
+DB table/config type, visibility (v2), lifecycle (v2), spec RFC (v2 Sprint 2 prep)
 
-#### [NEW] [loader.py](file:///c:/Users/Binulawso2/Desktop/nexus/graph/loader.py)
+#### ✅ `graph/loader.py`
 
-Three-phase bulk loading:
+Three-phase bulk loading (idempotent MERGE):
 
-**Phase 1 — Nodes** (idempotent MERGE):
+**Phase 1 — Nodes:**
 ```cypher
 UNWIND $batch AS item
 MERGE (n:LogicUnit {geid: item.geid})
-SET n.fqn = item.fqn, n.kind = item.kind, n.file_path = item.file_path,
-    n.start_line = item.start_line, n.end_line = item.end_line
+SET n.fqn = item.fqn, n.visibility = item.visibility,
+    n.is_static = item.is_static, n.lifecycle_role = item.lifecycle_role,
+    n.annotations = item.annotations  -- JSON string
 ```
 
-**Phase 2 — Hierarchy Edges**:
-```cypher
-UNWIND $batch AS item
-MATCH (parent {geid: item.parent_geid})
-MATCH (child {geid: item.child_geid})
-MERGE (parent)-[:DECLARES]->(child)
-```
+**Phase 2 — Hierarchy edges** (CONTAINS, DECLARES, HAS_METHOD)
 
-**Phase 3 — Cross-reference Edges** (APOC batched):
+**Phase 3 — Cross-reference edges** via APOC batch:
 ```cypher
 CALL apoc.periodic.iterate(
   'MATCH (a:LogicUnit) WHERE size(a._calls_fqn) > 0 RETURN a',
-  'UNWIND a._calls_fqn AS target_fqn
-   MATCH (b:LogicUnit {fqn: target_fqn})
-   MERGE (a)-[:CALLS]->(b)',
-  {batchSize: 500, parallel: false}
+  'UNWIND a._calls_fqn AS fqn MATCH (b:LogicUnit {fqn: fqn}) MERGE (a)-[:CALLS]->(b)',
+  {batchSize: 500}
 )
 ```
 
-#### [NEW] [queries.py](file:///c:/Users/Binulawso2/Desktop/nexus/graph/queries.py)
-
-Reusable Cypher query templates:
-
-| Query Function | Purpose | Cypher Pattern |
-|---|---|---|
-| `blast_radius(geid, depth)` | Find all affected nodes N-hops out | `MATCH (n {geid})-[*1..N]->(m) RETURN m` |
-| `find_implementors(interface_fqn)` | Classes implementing an interface | `MATCH (c)-[:IMPLEMENTS]->(i {fqn}) RETURN c` |
-| `find_dangling_calls()` | Calls to non-existent FQNs | `MATCH (a:LogicUnit) WHERE ... NOT EXISTS ...` |
-| `dependency_chain(src, tgt)` | Shortest module dependency path | `shortestPath((a:Module)-[:DEPENDS_ON*]-(b:Module))` |
-| `get_stats()` | Node/edge count summary | `MATCH (n) RETURN labels(n), count(n)` |
+All writes call `.consume()` to prevent Neo4j lazy-execution silent drops.
 
 ---
 
-### Component 4: ChromaDB Semantic Store
+### Component 4: ChromaDB Semantic Store ✅
 
-#### [NEW] [chunker.py](file:///c:/Users/Binulawso2/Desktop/nexus/vectorstore/chunker.py)
+#### ✅ `vectorstore/chunker.py`
 
-Functional chunking — never splits by character count:
+Functional chunking — one method = one chunk (never character-count splits):
+- `code_logic` chunk: method signature + body
+- `code_intent` chunk: parsed Javadoc (if present)
 
-| Chunk Type | Source Field | Use Case |
-|---|---|---|
-| `logic_chunk` | `LogicUnit.body_text` | "Find code similar to this function" |
-| `intent_chunk` | `LogicUnit.docstring` + inline comments | "Where is the token validation logic?" |
+#### ✅ `vectorstore/embedder.py`
 
-Each chunk carries GEID + FQN + file path metadata for the graph bridge.
-
-#### [NEW] [embedder.py](file:///c:/Users/Binulawso2/Desktop/nexus/vectorstore/embedder.py)
-
-- Uses `sentence-transformers` with `all-MiniLM-L6-v2` (384-dimensional, CPU-friendly)
-- Creates two ChromaDB collections:
-  - `code_logic` — Function body embeddings
-  - `code_intent` — Docstring/comment embeddings
-- Supports incremental upsert by GEID (no full re-index needed)
-- Batch embedding with configurable batch size (default: 100)
+- Uses `all-MiniLM-L6-v2` (384-dimensional, CPU-only)
+- Two collections: `code_logic` + `code_intent`
+- Batch upsert with configurable `EMBEDDING_BATCH_SIZE`
+- Automatic batch-splitting retry for large payloads
 
 ---
 
-### Component 5: Cross-Repo Linker
+### Component 5: Cross-Repo Linker ✅
 
-#### [NEW] [dependency_resolver.py](file:///c:/Users/Binulawso2/Desktop/nexus/linker/dependency_resolver.py)
+#### ✅ `linker/maven_resolver.py`
 
-| Build System | Parse Strategy | Output |
-|---|---|---|
-| **Maven** (`pom.xml`) | `lxml.etree` → extract `<dependency>` elements | `(ModuleA)-[:DEPENDS_ON {scope}]->(ModuleB)` |
-| **Gradle** (`build.gradle`) | Regex-based `implementation`/`api` extraction (basic) | `(ModuleA)-[:DEPENDS_ON]->(ModuleB)` |
+Reads `pom.xml` → extracts `<dependency>` elements → `DEPENDS_ON` edges between Maven modules.
+Builds global module registry for cross-repo dependency resolution.
 
-Resolution logic:
-1. Parse all build files across all repos
-2. Build a global module registry: `{artifactId → module_geid}`
-3. Match each dependency to a known module in the registry
-4. Create `[:DEPENDS_ON]` edges for resolved dependencies
-5. Log unresolved dependencies for debugging
+#### ✅ `linker/api_bridge.py`
 
-#### [NEW] [api_bridge.py](file:///c:/Users/Binulawso2/Desktop/nexus/linker/api_bridge.py)
-
-Two-pass detection:
-
-1. **Registration Pass**: Scan all Java files for `@RequestMapping` / `@GetMapping` / `@PostMapping` annotations → build endpoint registry
-2. **Detection Pass**: Scan all Java files for `RestTemplate`, `WebClient`, or `FeignClient` calls → extract URL patterns
-3. **Matching**: Compare URL patterns against registered endpoints → create `[:REMOTE_CALLS]` edges with `protocol`, `method`, and `path` properties
-
-#### [NEW] [cross_repo.py](file:///c:/Users/Binulawso2/Desktop/nexus/linker/cross_repo.py)
-
-Orchestrator that runs:
-1. `dependency_resolver.resolve_all(projects)` → build dependency edges
-2. `api_bridge.detect_bridges(projects)` → build remote call edges
-3. Report summary: resolved deps, unresolved deps, detected bridges
+Two-pass REST bridge detection:
+1. **Pass 1**: Register all Spring + JAX-RS endpoints (with class-level + method-level path composition)
+2. **Pass 2**: Detect HTTP client calls, match against registry → `REMOTE_CALLS` edges
 
 ---
 
-### Component 6: Ingestion Pipeline & CLI
+### Component 6: Ingestion Pipeline & CLI ✅
 
-#### [NEW] [mirror.py](file:///c:/Users/Binulawso2/Desktop/nexus/pipeline/mirror.py)
+#### ✅ `pipeline/mirror.py`
 
-Git repository manager:
-- Reads `repos.yaml` manifest (`url`, `branch`, `name` per repo)
-- Shallow clones new repos (`depth=1` for speed)
-- Pulls existing repos to latest
-- Returns list of local paths for parser consumption
+Reads `repos.yaml`, runs `git clone` (first time) or `git pull` (subsequent).
 
-#### [NEW] [orchestrator.py](file:///c:/Users/Binulawso2/Desktop/nexus/pipeline/orchestrator.py)
+#### ✅ `pipeline/orchestrator.py`
 
-The 4-stage Data Factory:
+Complete pipeline conductor. Runs all stages sequentially with Redis state tracking.
 
-```mermaid
-flowchart LR
-    S1["🪞 Mirror<br/>Clone/Pull repos"] --> S2["🔬 Extract<br/>AST → UIR"]
-    S2 --> S3["🔗 Link<br/>Resolve deps"]
-    S3 --> S4["📦 Load<br/>Neo4j + ChromaDB"]
+#### ✅ `pipeline/cli.py`
+
+Click-based CLI: `nexus ingest`, `nexus update`, `nexus validate`, `nexus stats`, `nexus analyze-pr`
+
+---
+
+## 3. Phase 02 — End-to-End Flow Extraction & Global Rollup ✅ Complete
+
+### Task 1 — SQL Schema & Configuration Parsers ✅
+
+#### ✅ `parsers/sql_schema_parser.py`
+
+Scans `dbscripts/` folders for `CREATE TABLE` DDL → `DatabaseTable` nodes + `QUERIES_TABLE` edges.
+
+#### ✅ `parsers/config_parser.py`
+
+Parses WSO2 configuration files:
+- `deployment.toml` — `tomllib` (Python 3.11+) with regex fallback
+- `*.xml` — element names + `${placeholder}` extraction
+- `*.properties` — `key=value` and `key: value` patterns
+- `application.yml` — top-level YAML keys
+
+### Task 2 — EntryPoint / DataSink Tagging ✅
+
+#### ✅ `graph/tagger.py`
+
+- `:EntryPoint` → `@RequestMapping`, `@Path`, `HttpServlet`, Controller/Servlet class patterns
+- `:DataSink` → `@Repository`, DAO patterns, `QUERIES_TABLE` edges, SQL method calls
+
+### Task 3 — GDS Dijkstra Flow Extraction ✅
+
+#### ✅ `graph/flow_extractor.py`
+
+- Projects execution-flow edges into GDS graph
+- Runs `gds.shortestPath.dijkstra.stream` for each (EntryPoint, DataSink) pair
+- Returns `FlowPath` objects enriched with config keys and table names
+
+### Task 4 — Flow Narrative Generation ✅
+
+#### ✅ `reasoning/flow_summarizer.py`
+
+- Parallel LLM calls via `ThreadPoolExecutor` (fast model)
+- Stores in ChromaDB `flow_narratives`
+
+### Task 5 — Global GraphRAG Rollup ✅
+
+#### ✅ `community/global_rollup.py`
+
 ```
-
-- Each stage returns a typed result object with metrics
-- `--repo` flag processes a single repo (incremental)
-- `--stage` flag starts from a specific stage (skip mirror for local repos)
-- Logs per-stage timing and counts
-
-#### [NEW] [cli.py](file:///c:/Users/Binulawso2/Desktop/nexus/pipeline/cli.py)
-
-Click-based CLI:
-
-```bash
-# Full pipeline
-nexus ingest --config repos.yaml
-
-# Individual stages
-nexus mirror --config repos.yaml
-nexus parse --repo java-sample
-nexus link
-nexus load
-
-# Validation
-nexus validate --check dangling-calls
-nexus validate --check graph-vector-sync
-nexus validate --check known-dependency "ModuleA" "ModuleC" --hops 3
-
-# Info
-nexus stats   # Node/relationship/vector counts
+L1: Leiden Community Summaries (individual clusters)
+L2: Sub-System Summaries (11 domains, fast model)
+L3: Global Architecture Document (strong model, single call)
 ```
 
 ---
 
-## 3. Sample Test Fixtures
+## 4. v2 Sprint 1 — WSO2-IS Parser Accuracy ✅ Complete
 
-#### [NEW] [sample_repos/java-sample/](file:///c:/Users/Binulawso2/Desktop/nexus/sample_repos/java-sample/)
+### 1.1 Method Modifiers + Visibility ✅
 
-Minimal Java Maven project:
-- `pom.xml` with dependencies on `shared-lib`
-- `UserService.java` — class implementing `IUserService` interface
-- `TokenValidator.java` — class with documented `validate()` method
-- `IUserService.java` — interface declaration
-
-#### [NEW] [sample_repos/repos.yaml](file:///c:/Users/Binulawso2/Desktop/nexus/sample_repos/repos.yaml)
-
-```yaml
-repositories:
-  - name: java-sample
-    path: ./sample_repos/java-sample
-    language: java
-    branch: main
-  - name: java-shared-lib
-    path: ./sample_repos/java-shared-lib
-    language: java
-    branch: main
-```
-
----
-
-## 4. Verification Plan
-
-### 4.1 Automated Tests (pytest)
-
-| Test File | Validates |
-|---|---|
-| `test_java_parser.py` | Java class/interface/enum/method extraction, FQN correctness, call graph |
-| `test_javadoc_parser.py` | Javadoc tag extraction (`@param`, `@return`, `@throws`), inline links |
-| `test_graph_loader.py` | Neo4j node creation, constraint enforcement, relationship edges |
-| `test_embedder.py` | ChromaDB collection creation, GEID metadata, semantic search recall |
-| `test_linker.py` | `pom.xml` Maven dependency resolution, API endpoint detection |
-| `test_pipeline.py` | End-to-end: sample repos → full pipeline → graph + vector validation |
-
-```bash
-cd c:\Users\Binulawso2\Desktop\nexus
-pip install -e ".[dev]"
-pytest tests/ -v --tb=short
-```
-
-### 4.2 Docker Integration Test
-
-```bash
-# 1. Start infrastructure
-docker-compose up -d
-
-# 2. Wait for health checks
-docker-compose ps  # All services should show "healthy"
-
-# 3. Run full pipeline
-python -m pipeline.cli ingest --config sample_repos/repos.yaml
-
-# 4. Validate
-python -m pipeline.cli validate --check dangling-calls
-python -m pipeline.cli validate --check graph-vector-sync
-python -m pipeline.cli stats
-```
-
-### 4.3 Manual Verification
-
-**Neo4j Browser** (`http://localhost:7474`):
-```cypher
--- Node counts
-MATCH (n) RETURN labels(n), count(n);
-
--- Relationship counts  
-MATCH ()-[r]->() RETURN type(r), count(r);
-
--- Visualize 3-hop call graph
-MATCH p=(a:LogicUnit)-[:CALLS*1..3]->(b:LogicUnit) RETURN p LIMIT 25;
-
--- Verify cross-repo dependency
-MATCH p=shortestPath((a:Module {name:"java-sample"})-[:DEPENDS_ON*]-(b:Module {name:"shared-lib"}))
-RETURN p;
-```
-
-**ChromaDB Semantic Search**:
+Added to `parsers/uir.py`:
 ```python
-import chromadb
-client = chromadb.HttpClient(host="localhost", port=8000)
-col = client.get_collection("code_intent")
-results = col.query(query_texts=["token validation logic"], n_results=5)
-# Should return TokenValidator.validate() as top result
+# LogicUnit
+visibility: str = "package"       # "public"|"protected"|"private"|"package"
+is_static: bool = False
+is_abstract: bool = False
+is_final: bool = False
+is_synchronized: bool = False
+
+# Component
+visibility: str = "public"
+is_abstract: bool = False
+is_final: bool = False
 ```
 
-> [!IMPORTANT]
-> Docker Desktop must be running on the machine before starting the integration test.
+Extraction via `modifiers` tree-sitter child node in `parsers/java_parser.py`.
+Written to Neo4j in `graph/loader.py` with new indexes in `graph/schema.py`.
+
+### 1.2 Full Annotation Value Parsing ✅
+
+Changed `annotations: list[str]` → `annotations: list[dict]` in `Component` and `LogicUnit`.
+
+New `_parse_annotation(node, source) → dict` in `parsers/java_parser.py`:
+- `marker_annotation` → `{"name": "Override"}`
+- Single-value → `{"name": "Value", "value": "${server.host}"}`
+- Named-attr → `{"name": "Reference", "cardinality": "MANDATORY"}`
+
+Stored in Neo4j as `json.dumps(annotations)`. Updated `load_annotated_with` in `graph/loader.py`.
+
+### 1.3 Parameter Annotation Extraction ✅
+
+Added `annotations: list[dict]` to `Parameter` in `parsers/uir.py`.
+Updated `_extract_parameters()` in `parsers/java_parser.py` to extract annotations
+on each `formal_parameter` node.
+
+Enables: `@QueryParam("client_id") String clientId` → `Parameter(name="clientId", annotations=[{"name":"QueryParam","value":"client_id"}])`
+
+### 1.4 Generic Type Preservation ✅
+
+`parsers/java_parser.py` now preserves generic types in `type_name` fields.
+Generics are stripped only for FQN-based graph MERGE keys via `_type_for_graph_key()`.
+
+### 1.5 Lambda / Stream Call Extraction ✅
+
+`_walk_calls()` in `parsers/java_parser.py` now recurses into lambda expression bodies,
+capturing calls inside `.stream().filter(x -> x.method())` chains.
+
+### 1.6 JAX-RS Path Composition + API Contracts ✅
+
+`linker/api_bridge.py` now:
+- Extracts class-level `@Path` before the first `{` in the source
+- Merges with method-level `@Path`: `effective_path = normalize(class_base + "/" + method_path)`
+- Extracts `@Consumes` / `@Produces` into `EndpointRegistration`
+
+### 1.7 OSGi Lifecycle + Config Parser Accuracy ✅
+
+**OSGi lifecycle**: `parsers/java_parser.py` detects `@Activate`, `@Deactivate`, `@Modified`
+→ sets `lifecycle_role` on `LogicUnit`. New index `logicunit_lifecycle` in `graph/schema.py`.
+
+**Config parser fixes** in `parsers/config_parser.py`:
+- TOML: replaced flat regex with `tomllib.load()` + `_flatten_toml_dict()` recursion
+- XML attributes: `_parse_xml_config()` already extracts element names + placeholders
+- Properties files: new `_scan_properties_file()` for `*.properties` files
 
 ---
 
-## 5. Phase 2 — End-to-End Flow Extraction & Global Rollup
+## 5. v2 Sprint 2 — RFC Specification Knowledge Base (Planned)
 
-> **Added**: Phase 2 upgrades the pipeline to extract, synthesise, and store
-> the "End-to-End Story" of all indexed repositories.
-
-### Task 1 — SQL Schema & Configuration Parsers
-
-#### [NEW] [parsers/sql_schema_parser.py](../parsers/sql_schema_parser.py)
-
-Scans `dbscripts/` folders for `CREATE TABLE` DDL statements.
-
-| Output | Description |
+### Files to Create
+| File | Purpose |
 |---|---|
-| `DatabaseTableInfo` | `{name, repo_name, file_path, columns}` → `DatabaseTable` Neo4j nodes |
-| `TableQueryEdge` | `{component_fqn, table_name}` → `QUERIES_TABLE` edges |
+| `parsers/rfc_fetcher.py` | Fetch + cache IETF RFC text (14 key IAM RFCs) |
+| `parsers/rfc_scanner.py` | Detect RFC citations in Java code + semantic inference |
+| `linker/osgi_resolver.py` | `@Reference` + `implements` index → `RESOLVES_TO` edges |
 
-Detection: Regex-based `CREATE TABLE` extraction + DAO class pattern matching.
-
-#### [NEW] [parsers/config_parser.py](../parsers/config_parser.py)
-
-Parses WSO2 `deployment.toml`, `repository/conf/*.xml`, and `application.yml`.
-
-| Output | Description |
+### Files to Modify
+| File | Changes |
 |---|---|
-| `ConfigurationInfo` | `{config_key, config_type, source_file, repo_name}` → `Configuration` Neo4j nodes |
-| `ConfigReadEdge` | `{component_fqn, config_key}` → `READS_CONFIG` edges |
+| `graph/schema.py` | `Specification.spec_id` constraint already added (Sprint 1 prep) |
+| `graph/loader.py` | `load_specifications()`, `load_spec_edges()`, `load_resolves_to_edges()` |
+| `pipeline/orchestrator.py` | Wire in rfc_fetcher, rfc_scanner, osgi_resolver |
+| `reasoning/reduce_step.py` | RFC evidence block in reduce prompt (zero extra LLM calls) |
+| `reasoning/graph_retriever.py` | `get_spec_sections(fqns)` |
+| `config/settings.py` | `RFC_CACHE_DIR`, `RFC_OFFLINE_MODE` |
 
-#### Schema additions (graph/schema.py)
-- Constraint: `DatabaseTable.name` UNIQUE
-- Constraint: `Configuration.config_key` UNIQUE
-- Index: `DatabaseTable.repo_name`
-- Index: `Configuration.config_type`
+### Key IAM RFCs to Index
 
----
-
-### Task 2 — EntryPoint / DataSink Tagging
-
-#### [NEW] [graph/tagger.py](../graph/tagger.py)
-
-Tags Neo4j nodes with secondary labels:
-
-| Label | Detection criteria |
+| RFC | Title |
 |---|---|
-| `:EntryPoint` | `@RequestMapping`, `@Path`, `HttpServlet`, Servlet/Controller/Endpoint/Resource FQN patterns |
-| `:DataSink` | `@Repository`, DAO/Repository class patterns, `QUERIES_TABLE` edges, SQL execution methods |
-
-Purely Cypher-based — no LLM. Runs after Leiden community summarisation.
-
----
-
-### Task 3 — GDS Dijkstra Flow Extraction
-
-#### [NEW] [graph/flow_extractor.py](../graph/flow_extractor.py)
-
-Uses GDS Dijkstra Shortest Path for EntryPoint→DataSink execution flow extraction.
-
-**Algorithm:**
-1. Project execution-flow edges (CALLS, INJECTS, IMPLEMENTS, OVERRIDES, REMOTE_CALLS) into GDS graph `nexus-flow-graph`
-2. Query all `:EntryPoint` and `:DataSink` nodes
-3. For each pair: `gds.shortestPath.dijkstra.stream` — O(E log V) per path
-4. Enrich paths with `READS_CONFIG` config keys and `QUERIES_TABLE` table names
-5. Return `FlowPath` objects
-
-**NO brute-force `*1..6` expansion.** Pure GDS algorithmic approach.
+| 6749 | OAuth 2.0 Authorization Framework |
+| 6750 | Bearer Token Usage |
+| 7519 | JSON Web Token (JWT) |
+| 7521 | Assertion Framework for OAuth 2.0 |
+| 7636 | PKCE for OAuth Public Clients |
+| 7591 | OAuth 2.0 Dynamic Client Registration |
+| 8693 | OAuth 2.0 Token Exchange |
+| 9068 | JWT Profile for OAuth 2.0 Access Tokens |
+| 7642–7644 | SCIM Definitions, Core Schema, Protocol |
 
 ---
 
-### Task 4 — Flow Narrative Generation
+## 6. v2 Sprint 3 — MCP Server (Planned)
 
-#### [NEW] [reasoning/flow_summarizer.py](../reasoning/flow_summarizer.py)
+### Files to Create
+| File | Purpose |
+|---|---|
+| `mcp_server.py` | MCP server with 4 tools for Cursor/Claude Desktop |
 
-Generates natural-language "End-to-End Architectural Stories" from `FlowPath` objects.
+### Four MCP Tools
 
-- Parallel LLM calls via `ThreadPoolExecutor`
-- Stored in ChromaDB `flow_narratives` collection
-- Each narrative describes: business process, data transformations, services crossed, tables written to, config keys consulted
+| Tool | LLM calls | Description |
+|---|---|---|
+| `query_codebase(question)` | 1 (strong model) | Full GraphRAG pipeline — answer any question |
+| `blast_radius(fqn, depth)` | 0 | Graph traversal only — impact analysis |
+| `audit_spec_compliance(fqn)` | 1 (strong model) | RFC compliance check with citation |
+| `recall_session(files_touched)` | 0 | Community summaries for developer orientation |
 
----
+### Cursor Configuration
 
-### Task 5 — Global GraphRAG Rollup
-
-#### [NEW] [community/global_rollup.py](../community/global_rollup.py)
-
-Microsoft GraphRAG hierarchical rollup:
-
+```json
+// ~/.cursor/mcp.json
+{
+  "nexus": {
+    "command": "py",
+    "args": ["/path/to/nexus/mcp_server.py"],
+    "env": {"PYTHONPATH": "/path/to/nexus"}
+  }
+}
 ```
-Level 1: Leiden Community Summaries (existing)
-    └─ individual clusters of tightly-coupled code
-Level 2: Sub-System Summaries (new)
-    └─ 11 domains: Authentication, OAuth2, SCIM, Federation,
-       Session, Consent, DCR, Discovery, CIBA, Token Exchange, Utility
-Level 3: Global Architecture Summary (new)
-    └─ Single master document covering the entire codebase
-```
-
-**ChromaDB collections:** `l2_subsystem_summaries`, `l3_global_architecture`
-
-**Query routing (Route D):** When a user asks "What is the overarching architecture?",
-the router (confidence 0.95) returns the L3 summary directly — no vector search needed.
 
 ---
 
-### Integration Summary
+## 7. v2 Sprint 4 — Query Intelligence & Performance (Planned)
 
-| Modified file | Changes |
+### 4.1 Two-Tier GPT Wiring ✅ (done in Sprint 1)
+All callers updated in `config/settings.py`. Community summarizer, map step, reduce step,
+and global rollup all call the correct model tier.
+
+### 4.2 Community Summary Fingerprint Cache
+`community/summarizer.py`: before calling LLM, compute `fqn_hash = sha256(sorted(fqns))[:12]`.
+Check ChromaDB for existing summary with same hash. Skip if unchanged.
+
+Effect: re-ingest after a 2-file PR costs ~$0 for summarisation (90%+ communities unchanged).
+
+### 4.3 Query Expansion
+`reasoning/router.py`: for conceptual queries, call fast model to generate 2 paraphrased
+sub-queries, merge results, dedup by community_id. Cost: ~$0.0001 per query.
+
+### 4.4 Cross-Encoder Re-Ranking (Free)
+`reasoning/map_step.py`: after cosine retrieval, re-rank with
+`cross-encoder/ms-marco-MiniLM-L-6-v2` (CPU, no API cost). Uses `sentence-transformers`
+which is already a dependency.
+
+### 4.5 Multiprocessing File Parsing
+`pipeline/_worker.py` + `pipeline/orchestrator.py`: `ProcessPoolExecutor` for parallel
+Java file parsing. Worker instantiates `JavaParser` inside the subprocess (tree-sitter C
+bindings don't pickle — cannot instantiate in the main process and share).
+
+### 4.6 Nomic Embeddings (Optional)
+`vectorstore/embedder.py`: opt-in `EMBEDDING_BACKEND=nomic` → `nomic-ai/nomic-embed-text-v1.5`
+(768-dim, better quality). Stored in separate collections (`code_logic_nomic`, `code_intent_nomic`)
+to avoid dimension collision. Requires `pip install nexus[nomic]`.
+
+---
+
+## 8. Verification Queries
+
+### Sprint 1 — Parser Accuracy
+```bash
+# Parse phase only
+py main.py ingest --dry-run
+```
+
+```cypher
+-- Verify visibility is populated
+MATCH (n:LogicUnit) WHERE n.visibility IS NOT NULL RETURN count(n)
+-- Expected: > 0
+
+-- Verify annotation dict format
+MATCH (n:LogicUnit) WHERE n.annotations CONTAINS '"name": "QueryParam"' RETURN n.fqn LIMIT 5
+-- Expected: JAX-RS methods with @QueryParam data
+
+-- Verify OSGi lifecycle
+MATCH (n:LogicUnit) WHERE n.lifecycle_role = 'activate' RETURN n.fqn LIMIT 5
+-- Expected: OSGi @Activate methods
+
+-- Verify public API methods
+MATCH (n:LogicUnit {visibility: 'public', is_static: false}) RETURN count(n)
+```
+
+### Sprint 2 — RFC Knowledge Base
+```cypher
+-- Verify Specification nodes created
+MATCH (s:Specification) RETURN count(s)
+-- Expected: 200-600
+
+-- Verify IMPLEMENTS_SPEC edges
+MATCH ()-[r:IMPLEMENTS_SPEC]->() RETURN count(r)
+-- Expected: > 0
+```
+
+```bash
+py main.py query "does the PKCE implementation comply with RFC 7636 section 4.2?"
+# Expected: answer cites actual RFC 7636 §4.2 text
+```
+
+### Sprint 3 — MCP Server
+```bash
+py mcp_server.py &
+# Expected: "CodeNexus MCP server running on stdio"
+# In Cursor: call blast_radius("com.wso2.carbon.identity.oauth.OAuthAdminService")
+```
+
+### Sprint 4 — Performance
+```bash
+# Second ingest after 2 file changes:
+# Log should show "Community X unchanged — skipping LLM call" for 90%+ of communities
+# Log should show "model=gpt-4o-mini" for summarization, "model=gpt-4o" for reduce
+```
+
+---
+
+## 9. What Is NOT Being Built
+
+| Dropped Idea | Reason |
 |---|---|
-| `graph/schema.py` | +2 constraints, +2 indexes for DatabaseTable/Configuration |
-| `graph/loader.py` | +4 methods: load_database_tables, load_queries_table_edges, load_configuration_nodes, load_reads_config_edges |
-| `graph/__init__.py` | Exports NodeTagger, FlowExtractor |
-| `parsers/__init__.py` | Exports SQLSchemaParser, ConfigurationParser |
-| `community/__init__.py` | Exports GlobalRollup |
-| `reasoning/router.py` | Route D (global), _GLOBAL_KEYWORDS, _global_route() |
-| `pipeline/orchestrator.py` | 5 new post-processing stages after Leiden |
+| Ollama / local LLM | GPT models only — simpler, no GPU requirement |
+| Full RFC markdown parser (200KB per RFC) | Section-only extraction gives 90% value at 5% complexity |
+| "Atomic Neo4j+ChromaDB transactions" | Architecturally impossible; WAL + compensating actions is correct approach |
+| Groovy/Kotlin parsers | Out of scope for WSO2-IS v2 |
+| Embedding fine-tuning | Ops burden exceeds value at current stage |
+| Rebuild orchestrator as `pipeline/ingest.py` | `orchestrator.py` is production-grade; rename breaks all tests |
