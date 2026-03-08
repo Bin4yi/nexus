@@ -230,7 +230,7 @@ class LexicalSearcher:
         """Pure-Python fallback grep — slower but zero external dependencies."""
         hits: list[GrepHit] = []
         for java_file in search_root.rglob("*.java"):
-            if len(hits) >= max_hits * 5:  # wider cap — filtering later
+            if len(hits) >= max_hits:
                 break
             try:
                 lines = java_file.read_text(encoding="utf-8", errors="ignore").splitlines()

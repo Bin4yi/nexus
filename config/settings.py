@@ -53,7 +53,7 @@ class Settings(BaseSettings):
 
     # ── LLM ───────────────────────────────────────────────────────────────────
     llm_provider: str = Field(default="openai")
-    llm_model: str = Field(default="gpt-5")
+    llm_model: str = Field(default="gpt-4o-mini")
     llm_api_key: str = Field(default="")
     # Azure OpenAI settings (used when llm_provider="azure")
     llm_azure_endpoint: str = Field(
@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     # ── GraphRAG / GDS ────────────────────────────────────────────────────────
     gds_graph_name: str = Field(default="codenexus-graph")
     max_context_tokens: int = Field(
-        default=32000,
+        default=8000,
         description="Hard token ceiling for every LLM call (prompt + output reserve).",
     )
     reflection_max_iterations: int = Field(default=2)
@@ -186,6 +186,11 @@ class Settings(BaseSettings):
         change to the .env file.
         """
         if self.llm_provider.lower() == "azure":
+            if not self.llm_azure_endpoint:
+                raise ValueError(
+                    "llm_azure_endpoint must be set when llm_provider='azure'. "
+                    "Set LLM_AZURE_ENDPOINT in your .env file."
+                )
             from openai import AzureOpenAI
             deployment = self.llm_deployment or self.llm_model
             return AzureOpenAI(

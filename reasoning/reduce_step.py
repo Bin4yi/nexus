@@ -709,7 +709,7 @@ class ReduceStep:
         if definitions:
             lines.append(f"**DEFINITION ({len(definitions)} location(s)):**")
             for h in definitions:
-                lines.append(f"  - `{h['file_path']}` line {h.get('edge_type','').split('line')[-1].strip()}")
+                lines.append(f"  - `{h['file_path']}` line {h.get('line_number', 'unknown')}")
                 if h.get("text"):
                     lines.append(f"    ```java\n    {h['text'][:120]}\n    ```")
 

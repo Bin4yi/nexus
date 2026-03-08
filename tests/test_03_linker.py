@@ -19,6 +19,14 @@ _maven = MavenResolver()
 _bridge = ApiBridgeDetector()
 
 
+@pytest.fixture(autouse=True)
+def clear_bridge_registry():
+    """Clear the API bridge registry before each test to prevent state pollution."""
+    _bridge._registry.clear()
+    yield
+    _bridge._registry.clear()
+
+
 # ── Maven Resolver (Tests 1-4) ────────────────────────────────────────────────
 
 def test_01_pom_dependency_parsed():

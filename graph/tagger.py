@@ -242,7 +242,7 @@ class NodeTagger:
                 result = session.run(
                     """
                     MATCH (lu:LogicUnit)
-                    WHERE lu.docstring CONTAINS $indicator
+                    WHERE lu.body_text CONTAINS $indicator
                       AND NOT lu:DataSink
                     SET lu:DataSink
                     RETURN count(lu) AS cnt

@@ -31,7 +31,9 @@ _ENCODER = tiktoken.get_encoding("cl100k_base")
 
 # Token budgets
 _SYSTEM_TOKENS = 300
-_OUTPUT_RESERVE = 1500
+_OUTPUT_TOKENS = 1500
+ROLE_OVERHEAD = 30  # approximate overhead for role metadata in chat completions
+_OUTPUT_RESERVE = _OUTPUT_TOKENS + ROLE_OVERHEAD
 _DATA_BUDGET = settings.max_context_tokens - _SYSTEM_TOKENS - _OUTPUT_RESERVE
 
 _SYSTEM_PROMPT = """\
@@ -151,7 +153,7 @@ class FlowNarrativeSummarizer:
         if not prompt:
             return None
 
-        token_count = len(_ENCODER.encode(_SYSTEM_PROMPT + prompt))
+        token_count = len(_ENCODER.encode(_SYSTEM_PROMPT + prompt)) + ROLE_OVERHEAD
 
         response = self.llm.chat.completions.create(
             model=settings.llm_model,
@@ -242,9 +244,9 @@ class FlowNarrativeSummarizer:
         # Truncate if exceeding budget
         tokens = len(_ENCODER.encode(prompt))
         if tokens > _DATA_BUDGET:
-            # Truncate the path details to fit
+            # Truncate path details from the end until within budget
             while tokens > _DATA_BUDGET and len(lines) > 10:
-                lines.pop(-3)  # Remove from the middle
+                lines.pop()  # Remove from the end consistently
                 prompt = "\n".join(lines)
                 tokens = len(_ENCODER.encode(prompt))
 

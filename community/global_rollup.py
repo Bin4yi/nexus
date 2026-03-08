@@ -193,10 +193,14 @@ class GlobalRollup:
             if count == 0:
                 return []
             # Fetch all documents (ChromaDB get with no filter returns all)
-            result = self.l1_collection.get(
-                limit=count,
-                include=["documents", "metadatas"],
-            )
+            try:
+                result = self.l1_collection.get(
+                    limit=count,
+                    include=["documents", "metadatas"],
+                )
+            except Exception as e:
+                logger.error("ChromaDB get() failed while fetching L1 summaries: %s", e)
+                return []
             summaries = []
             if result["ids"]:
                 for i, doc_id in enumerate(result["ids"]):

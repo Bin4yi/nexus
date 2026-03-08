@@ -61,7 +61,9 @@ def test_02_interface_parsed(parsed_components):
     # The fixture has 'implements IUserService' — parser should extract it.
     # Accept either the full FQN or simple name depending on import resolution.
     all_impls = " ".join(user_service.implements)
-    assert "IUserService" in all_impls or len(user_service.implements) >= 0  # graceful
+    assert "IUserService" in all_impls, (
+        f"Expected IUserService in implements list, got: {user_service.implements}"
+    )
 
 
 def test_03_enum_and_annotation_kinds():

@@ -108,13 +108,16 @@ def build_community_prompt(
     )
 
     truncated = False
-    # Fit node lines within DATA_BUDGET
+    # Fit node lines within budget — include SYSTEM_PROMPT tokens to stay under hard limit
+    output_reserve = OUTPUT_RESERVE
     while node_lines:
         body = header + "\n".join(node_lines) + boundary_section + footer
-        if count_tokens(body) <= DATA_BUDGET:
+        if count_tokens(SYSTEM_PROMPT + body) <= (settings.max_context_tokens - output_reserve):
             break
         node_lines.pop()   # remove lowest-priority (last method) node
         truncated = True
+        if not node_lines:
+            break  # guard: header alone may exceed budget
 
     prompt = header + "\n".join(node_lines) + boundary_section + footer
     return prompt, truncated

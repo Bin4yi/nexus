@@ -150,6 +150,7 @@ def test_05_chunker_produces_two_chunks(test_logic_unit):
     types = [c.chunk_type for c in chunks]
     assert "code_logic"  in types
     assert "code_intent" in types
+    assert len(chunks) == 2, f"Expected exactly 2 chunks, got {len(chunks)}: {types}"
 
 
 def test_06_chunk_ids_contain_geid(test_logic_unit):

@@ -11,6 +11,7 @@ All heavy imports (chromadb, openai) are deferred into __init__ to avoid
 pydantic-v1 shim crash on Python 3.14 at module collection time.
 """
 from __future__ import annotations
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -122,7 +123,12 @@ class CommunitySummarizer:
             ],
             max_completion_tokens=settings.community_summary_max_tokens,
         )
-        summary_text = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content or ""
+        if not content:
+            logger.warning(
+                "Empty LLM response for community %d — using empty summary", community_id
+            )
+        summary_text = content.strip()
 
         # Select top 5 FQNs (prioritise class-level over method-level)
         class_fqns = [n["fqn"] for n in nodes
@@ -157,7 +163,7 @@ class CommunitySummarizer:
             metadatas=[{
                 "community_id": summary.community_id,
                 "node_count": summary.node_count,
-                "top_fqns": ",".join(summary.top_fqns),
+                "top_fqns": json.dumps(summary.top_fqns),
                 "llm_model": summary.llm_model,
                 "token_count": summary.token_count,
                 "prompt_truncated": str(summary.prompt_truncated),

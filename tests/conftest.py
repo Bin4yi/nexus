@@ -27,6 +27,9 @@ def neo4j_driver():
     )
     driver.verify_connectivity()
     yield driver
+    # Teardown: remove all test data to avoid cross-test contamination
+    with driver.session() as session:
+        session.run("MATCH (n) DETACH DELETE n")
     driver.close()
 
 

@@ -147,7 +147,15 @@ class ApiBridgeDetector:
             for match in re.finditer(pattern_str, source, re.DOTALL):
                 path = match.group(1).strip()
                 norm_path = self._normalize_path(path)
-                handler_fqn = f"{class_fqn}.handler"  # best-effort
+                # Extract actual method name from source following the annotation
+                method_name = "handler"  # fallback
+                pos = match.end()
+                method_match = re.search(
+                    r'\bpublic\s+[\w<>\[\], ]+\s+(\w+)\s*\(', source[pos:pos + 300]
+                )
+                if method_match:
+                    method_name = method_match.group(1)
+                handler_fqn = f"{class_fqn}.{method_name}"
                 geid = geid_map.get(handler_fqn, "")
                 self._registry.append(
                     EndpointRegistration(
@@ -175,7 +183,15 @@ class ApiBridgeDetector:
             method_match = self._JAXRS_METHOD_RE.search(window_text)
             http_method = method_match.group(1) if method_match else "GET"
 
-            handler_fqn = f"{class_fqn}.handler"
+            # Extract actual method name from nearby lines following the @Path annotation
+            method_name = "handler"  # fallback
+            search_text = "\n".join(lines[i:min(len(lines), i + 5)])
+            method_match = re.search(
+                r'\bpublic\s+[\w<>\[\], ]+\s+(\w+)\s*\(', search_text
+            )
+            if method_match:
+                method_name = method_match.group(1)
+            handler_fqn = f"{class_fqn}.{method_name}"
             geid = geid_map.get(handler_fqn, "")
             self._registry.append(
                 EndpointRegistration(

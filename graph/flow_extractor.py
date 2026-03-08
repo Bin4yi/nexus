@@ -213,8 +213,8 @@ class FlowExtractor:
                     "CALL gds.graph.drop($name, false) YIELD graphName RETURN graphName",
                     name=_FLOW_GRAPH_NAME,
                 ).consume()
-            except Exception:
-                pass  # May not exist
+            except Exception as e:
+                logger.debug("GDS projection drop failed (may not exist): %s", e)
 
     @_flow_retry
     def _get_entry_sink_pairs(self, max_pairs: int) -> list[tuple]:

@@ -82,7 +82,7 @@ class IncrementalUpdater:
             "nodes_updated":    0,
             "edges_deleted":    0,
             "edges_created":    0,
-            "communities_resummmarized": 0,
+            "communities_resummarized": 0,
         }
 
         # Step 1: Get changed files
@@ -126,7 +126,7 @@ class IncrementalUpdater:
             affected = self._find_affected_communities(all_geids)
             for cid in affected:
                 self.summarizer.summarize_community(cid)
-            stats["communities_resummmarized"] = len(affected)
+            stats["communities_resummarized"] = len(affected)
 
         logger.info("Incremental update complete: %s", stats)
         return stats

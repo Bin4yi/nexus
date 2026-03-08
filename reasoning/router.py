@@ -192,16 +192,16 @@ class QueryRouter:
 
     def _chroma_exec(self, fn, *args, **kwargs):
         """Run fn(chroma_client, *args, **kwargs) with one reconnect-retry on disconnect."""
-        _disconnected = ("RemoteDisconnected", "Connection aborted",
-                         "ConnectionAbortedError", "RemoteDisconnected")
         for attempt in range(2):
             try:
                 return fn(self.chroma, *args, **kwargs)
-            except Exception as e:
-                if attempt == 0 and any(k in str(e) for k in _disconnected):
+            except (ConnectionError, TimeoutError, ConnectionAbortedError) as e:
+                if attempt == 0:
                     logger.warning("ChromaDB connection dropped — reconnecting (attempt %d)", attempt + 1)
                     self._reconnect_chroma()
                     continue
+                raise
+            except Exception:
                 raise
 
     def route(self, question: str) -> RouterResult:
@@ -224,8 +224,12 @@ class QueryRouter:
                 question, classification.symbols, classification.entity_names,
             )
         if classification.bucket == "exact":
-            # If confidence is below threshold, skip expensive Neo4j probe
-            if classification.confidence < settings.router_confidence_threshold:
+            # Always use deterministic route for clear CamelCase/FQN patterns
+            is_camel_case = any(
+                re.match(r'^[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+$', name)
+                for name in classification.entity_names
+            )
+            if not is_camel_case and classification.confidence < settings.router_confidence_threshold:
                 logger.info(
                     "Exact confidence %.2f < threshold %.2f — falling back to semantic",
                     classification.confidence,
@@ -366,11 +370,14 @@ class QueryRouter:
         """
         logger.info("Route: EXACT-ENTITY")
         seed_nodes: list[dict] = []
+        seen_fqns: set[str] = set()
         for name in entity_names:
             nodes = self.retriever.find_nodes(name)
-            if nodes:
-                seed_nodes.extend(nodes)
-                break  # first match anchors the traversal
+            for node in nodes:
+                fqn = node.get("fqn")
+                if fqn and fqn not in seen_fqns:
+                    seed_nodes.append(node)
+                    seen_fqns.add(fqn)
 
         seed_fqns = [n["fqn"] for n in seed_nodes]
         blast = self.retriever.compute_blast_radius(
@@ -405,8 +412,6 @@ class QueryRouter:
         ROUTE C: ChromaDB vector search on ``community_summaries``.
         """
         logger.info("Route: SEMANTIC")
-        _disconnected = ("RemoteDisconnected", "ConnectionAborted",
-                         "Connection aborted", "RemoteDisconnected")
         for _attempt in range(2):
             try:
                 col = self.chroma.get_collection(COMMUNITY_COLLECTION)
@@ -414,12 +419,14 @@ class QueryRouter:
                     query_texts=[question], n_results=min(20, col.count()),
                 )
                 break  # success
-            except Exception as e:
-                _emsg = str(e)
-                if _attempt == 0 and any(k in _emsg for k in _disconnected):
+            except (ConnectionError, TimeoutError, ConnectionAbortedError) as e:
+                if _attempt == 0:
                     logger.warning("ChromaDB connection dropped — reconnecting and retrying")
                     self._reconnect_chroma()
                     continue
+                logger.error("ChromaDB semantic search failed: %s", e)
+                return RouterResult("semantic", [], [], [], [], [], entity_names, [])
+            except Exception as e:
                 logger.error("ChromaDB semantic search failed: %s", e)
                 return RouterResult("semantic", [], [], [], [], [], entity_names, [])
 

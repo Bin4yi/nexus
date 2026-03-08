@@ -232,9 +232,21 @@ class MapStep:
                 # Convert to 0-100 score: score = max(0, round((1 - distance) * 100))
                 # For cosine distance (0=identical, 2=opposite): score = (1 - d/2) * 100
                 dist = results["distances"][0][i]
+                if dist > 2:
+                    logger.warning(
+                        "Distance > 2 detected (likely L2, not cosine): %f for doc %s. "
+                        "Ensure ChromaDB collection uses cosine distance.",
+                        dist, doc_id,
+                    )
                 score = max(0, round((1.0 - dist / 2.0) * 100))
+                cid = meta.get("community_id")
+                if cid is None:
+                    try:
+                        cid = int(doc_id.split("_")[-1])
+                    except (ValueError, IndexError):
+                        raise ValueError(f"Invalid community_id format: {doc_id}")
                 candidates.append({
-                    "community_id": meta.get("community_id", 0),
+                    "community_id": cid,
                     "summary_text": results["documents"][0][i],
                     "score": score,
                 })
@@ -288,8 +300,14 @@ class MapStep:
             for i, doc_id in enumerate(results["ids"]):
                 meta = results["metadatas"][i] if results.get("metadatas") else {}
                 doc = results["documents"][i] if results.get("documents") else ""
+                cid = meta.get("community_id") if meta else None
+                if cid is None:
+                    try:
+                        cid = int(doc_id.split("_")[-1])
+                    except (ValueError, IndexError):
+                        raise ValueError(f"Invalid community_id format: {doc_id}")
                 candidates.append({
-                    "community_id": meta.get("community_id", 0) if meta else 0,
+                    "community_id": cid,
                     "summary_text": doc or "",
                 })
         logger.info(

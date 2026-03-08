@@ -137,11 +137,15 @@ class IngestionPipeline:
             all_java_files.extend(java_files)
             stats["files_parsed"] += len(java_files)
 
-            # Build project hierarchy from pom.xml
+            # Build project hierarchy from pom.xml — parse ALL pom files in the repo
             pom_files = self.maven.find_poms(repo_path)
             module_info, dep_edges = {}, []
             if pom_files:
-                module_info, dep_edges = self.maven.parse_pom(pom_files[0])
+                for pom_file in pom_files:
+                    info, edges = self.maven.parse_pom(pom_file)
+                    if not module_info:
+                        module_info = info  # use first pom's module info for project identity
+                    dep_edges.extend(edges)
 
             proj_geid = generate_geid(repo_name, repo_name)
             mod_geid  = generate_geid(repo_name, module_info.get("artifact_id", repo_name))
@@ -349,9 +353,23 @@ class IngestionPipeline:
         logger.info("Pipeline complete: %s", stats)
         return stats
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self.neo4j_driver.close()
+        except Exception as e:
+            logger.warning("Failed to close Neo4j driver: %s", e)
+        try:
+            self.redis.close()
+        except Exception as e:
+            logger.warning("Failed to close Redis client: %s", e)
+        return False
+
     def _set_status(self, key: str, value: str) -> None:
         """Write pipeline state to Redis."""
         try:
             self.redis.set(f"nexus:pipeline:{key}", value, ex=3600)
-        except Exception:
-            pass  # Redis is optional — don't fail pipeline on Redis error
+        except Exception as e:
+            logger.warning("Redis state update failed: %s", e)
