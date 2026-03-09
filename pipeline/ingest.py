@@ -183,9 +183,17 @@ def run_parallel_parse(
         len(java_files), workers, _FILE_BATCH_SIZE,
     )
 
-    # Split files into batches
+    # Split files into batches.
+    # On Windows, prefix paths >260 chars with \\?\ to bypass MAX_PATH limit.
+    import sys as _sys
+    def _path_str(p: Path) -> str:
+        s = str(p)
+        if _sys.platform == "win32" and len(s) > 260 and not s.startswith("\\\\?\\"):
+            return "\\\\?\\" + s
+        return s
+
     batches = [
-        ([str(f) for f in java_files[i: i + _FILE_BATCH_SIZE]], repo_name)
+        ([_path_str(f) for f in java_files[i: i + _FILE_BATCH_SIZE]], repo_name)
         for i in range(0, len(java_files), _FILE_BATCH_SIZE)
     ]
 

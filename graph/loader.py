@@ -591,11 +591,15 @@ class Neo4jLoader:
                     MATCH (c:Component {geid: $geid})
                     MATCH (s:Specification {rfc_number: $rfc_number})
                     MERGE (c)-[r:IMPLEMENTS_SPEC]->(s)
-                    SET r.citation_context = $citation_context
+                    SET r.citation_context = $citation_context,
+                        r.match_type = $match_type,
+                        r.similarity_score = $similarity_score
                     """,
                     geid=edge.component_geid,
                     rfc_number=edge.rfc_number,
                     citation_context=edge.citation_context,
+                    match_type=getattr(edge, "match_type", "citation"),
+                    similarity_score=getattr(edge, "similarity_score", 1.0),
                 ).consume()
         logger.info("Loaded %d [:IMPLEMENTS_SPEC] edges", len(edges))
 

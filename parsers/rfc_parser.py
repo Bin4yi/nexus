@@ -54,12 +54,23 @@ class SpecificationInfo:
 
 
 @dataclass
+class RFCSection:
+    """A single numbered section within an RFC document."""
+    rfc_number: int
+    section_number: str   # e.g. "4.1"
+    section_title: str    # e.g. "Authorization Code Grant"
+    body_text: str        # full section text (header + body)
+
+
+@dataclass
 class SpecImplementsEdge:
-    """A Java Component that cites an RFC in its source/Javadoc."""
+    """A Java Component that implements an RFC section (by citation or semantic match)."""
     component_geid: str
     component_fqn: str
     rfc_number: int
-    citation_context: str  # surrounding comment text for traceability
+    citation_context: str  # surrounding comment text or matched section title
+    match_type: str = "citation"   # "citation" | "semantic"
+    similarity_score: float = 1.0  # 1.0 for citations; cosine sim for semantic
 
 
 class RFCParser:
@@ -96,6 +107,58 @@ class RFCParser:
 
         logger.info("Parsed %d RFC specification files from %s", len(specs), rfc_dir)
         return specs
+
+    def chunk_rfc_sections(
+        self, specs: list[SpecificationInfo]
+    ) -> list[RFCSection]:
+        """
+        Split each RFC file into its numbered sections.
+
+        Section headers in plain-text RFCs look like:
+            1.  Introduction
+            2.1.  Roles
+            4.1.1.  Authorization Code Grant
+
+        Returns a list of RFCSection objects with at least 100 chars of body text.
+        """
+        sections: list[RFCSection] = []
+        # Matches "4.1.  Section Title" — number(s), optional trailing dot, 2+ spaces, title
+        _section_re = re.compile(
+            r"^(\d+(?:\.\d+)*\.?)\s{2,}([A-Z][^\n]{2,80})$",
+            re.MULTILINE,
+        )
+        for spec in specs:
+            try:
+                content = Path(spec.source_file).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            matches = list(_section_re.finditer(content))
+            for idx, m in enumerate(matches):
+                sec_num = m.group(1).rstrip(".")
+                sec_title = m.group(2).strip()
+                body_start = m.end()
+                body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+                body = content[body_start:body_end].strip()
+
+                # Skip boilerplate/TOC entries (too short) and appendices
+                if len(body) < 100:
+                    continue
+
+                # Combine header + body so the embedding captures full context
+                full_text = f"{sec_num}. {sec_title}\n\n{body}"
+                sections.append(RFCSection(
+                    rfc_number=spec.rfc_number,
+                    section_number=sec_num,
+                    section_title=sec_title,
+                    body_text=full_text,
+                ))
+
+        logger.info(
+            "Chunked %d RFC sections from %d specifications",
+            len(sections), len(specs),
+        )
+        return sections
 
     def detect_rfc_citations(
         self,

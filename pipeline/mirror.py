@@ -114,12 +114,14 @@ class RepositoryMirror:
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _clone(self, url: str, dest: Path, branch: str) -> Path:
+        dest = dest.resolve()
         logger.info("Cloning %s → %s (branch: %s)", url, dest, branch)
         Repo.clone_from(url, str(dest), branch=branch, depth=1)
         logger.info("Clone complete: %s", dest)
         return dest
 
     def _pull(self, dest: Path, branch: str) -> Path:
+        dest = dest.resolve()
         logger.info("Pulling %s (branch: %s)", dest, branch)
         repo = Repo(str(dest))
         origin = repo.remotes.origin

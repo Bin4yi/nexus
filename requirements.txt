@@ -16,7 +16,7 @@ neo4j>=5.0,<6.0
 
 # ── Vector store (ChromaDB) ──────────────────────────────────────────────────
 # Deferred import in fixtures — safe to install on Python 3.14
-chromadb>=0.4.0,<0.6.0
+chromadb>=1.0.0,<2.0.0
 
 # ── Embeddings ───────────────────────────────────────────────────────────────
 sentence-transformers>=2.0

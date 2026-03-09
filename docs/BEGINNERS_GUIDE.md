@@ -98,8 +98,10 @@ Your Java repos on GitHub / GitLab
        │
        ▼
   RFC Specification Grounding
-  (RFC markdown files → (:Specification) nodes;
-   "// RFC 6749" citations in Java → [:IMPLEMENTS_SPEC] edges)
+  (RFC text files → (:Specification) nodes;
+   Stage 1: ChromaDB retrieves top-5 candidate classes per RFC section;
+   Stage 2: GPT-4o-mini verifies which candidates actually implement it;
+   [:IMPLEMENTS_SPEC] edges written with match_type + confidence score)
        │
        ▼
   Ollama Local Micro-Drafts (optional)
@@ -358,10 +360,11 @@ CodeNexus uses two OpenAI models with different cost/quality trade-offs:
 
 | Model | Used for | Why |
 |---|---|---|
-| **gpt-4o-mini** (fast) | Community summarisation (bulk), map-step scoring, flow narratives, L2 sub-system rollup | ~90% cheaper than gpt-4o; adequate for bulk tasks |
+| **gpt-4o-mini** (fast) | Community summarisation (bulk), map-step scoring, flow narratives, L2 sub-system rollup, **RFC-to-code verification** | ~90% cheaper than gpt-4o; adequate for bulk tasks |
 | **gpt-4o** (strong) | Final reduce answer, L3 global rollup only | Best quality for the answer the user sees |
 
 This means a full ingest of 100 repos costs ~$0.50 instead of ~$5+ if everything used gpt-4o.
+RFC verification adds ~$0.18 for 14 RFCs (one GPT-4o-mini call per RFC section, ~800 calls total).
 
 **What the LLM does NOT do:** It does not search. It does not access the internet.
 It only reads the evidence we hand it and synthesises an answer.
@@ -415,16 +418,59 @@ the implementation.
 
 ### RFC Specification Grounding
 **What it is:** IETF RFCs (Request for Comments) are the official specifications for
-internet protocols. OAuth 2.0 is RFC 6749. JWT is RFC 7519.
+internet protocols. OAuth 2.0 is RFC 6749. JWT is RFC 7519. Token Exchange is RFC 8693.
 
 **Why it matters:** When you ask "does this correctly implement RFC 8693 token exchange?",
-the system can cross-reference the specification text against the code that cites it.
+the system can show you exactly which Java classes are responsible for that requirement —
+even when the code has no comments mentioning RFC numbers at all.
 
-**How it works:**
-- Place RFC markdown files in the `./rfcs/` directory
-- `parsers/rfc_parser.py` parses them into `(:Specification)` nodes in Neo4j
-- Java source comments like `// RFC 6749`, `// See RFC 7519 Section 4.1` are detected automatically
-- `[:IMPLEMENTS_SPEC]` edges link the Java class to the specification node
+**The problem with regex matching:** Enterprise codebases like WSO2 Identity Server almost
+never write comments like `// RFC 6749` or `@see RFC 7519`. Scanning Java source for explicit
+RFC citations would find almost nothing. This is why a two-stage LLM approach is used instead.
+
+**How it works — two stages:**
+
+**Stage 1 — Candidate Retrieval (ChromaDB, cheap):**
+- `parsers/rfc_parser.py` reads each RFC text file and splits it into numbered sections
+  (e.g. RFC 6749 produces 98 sections: §1 Introduction, §4.1 Authorization Code Grant, etc.)
+- Each section's text is queried against the `code_intent` ChromaDB collection
+  (which holds Javadoc/description embeddings of every Java class)
+- The top 5 most semantically similar Java classes are returned as candidates
+- This narrows ~100,000 classes down to 5 candidates per RFC section
+
+**Stage 2 — LLM Verification (GPT-4o-mini, accurate):**
+- For each RFC section, ONE GPT-4o-mini call is made containing:
+  - The RFC section title and full requirement text
+  - The 5 candidate Java classes with their FQN and Javadoc description
+- The LLM answers: which of these candidates genuinely *implements* this requirement?
+- It returns a structured JSON response: `{fqn, implements: true/false, confidence: 0–1, reason}`
+- Only candidates with `implements=true` and `confidence ≥ 0.70` become `[:IMPLEMENTS_SPEC]` edges
+
+**Why LLM is necessary here (not just embeddings):**
+Embeddings measure surface-level similarity — they can tell that "token introspection"
+and `TokenValidator.java` are in the same ballpark. But they cannot reason about protocol
+flow. The LLM reads both the spec requirement and the class description and makes a judgment:
+"Yes, `TokenExchangeGrantHandler` implements RFC 8693 §2.1 because it processes the
+`urn:ietf:params:oauth:grant-type:token-exchange` grant type the spec defines."
+
+**What gets stored in Neo4j:**
+- `(:Specification {rfc_number: 8693, title: "OAuth 2.0 Token Exchange"})` nodes
+- `[:IMPLEMENTS_SPEC {match_type: "llm", similarity_score: 0.92, citation_context: "RFC 8693 §2.1: Token Exchange Request — Handles the grant_type token-exchange flow."}]` edges
+
+**Cost:** ~800 LLM calls for 14 RFCs ≈ $0.18 total at GPT-4o-mini pricing. Runs once per ingest.
+
+**What you can query after ingestion:**
+```cypher
+// Which classes implement OAuth 2.0 token exchange?
+MATCH (c:Component)-[r:IMPLEMENTS_SPEC]->(s:Specification {rfc_number: 8693})
+RETURN c.fqn, r.similarity_score, r.citation_context
+ORDER BY r.similarity_score DESC
+
+// All LLM-verified spec mappings with high confidence
+MATCH (c:Component)-[r:IMPLEMENTS_SPEC]->(s:Specification)
+WHERE r.match_type = 'llm' AND r.similarity_score > 0.85
+RETURN c.fqn, s.rfc_number, r.citation_context
+```
 
 ---
 
@@ -535,7 +581,8 @@ previous regex-based parser would miss or mislabel nested sections.
 | `parsers/sql_schema_parser.py` | **SQL DDL Parser.** Scans `dbscripts/` for `CREATE TABLE` statements → `DatabaseTable` nodes + `QUERIES_TABLE` edges. |
 | `parsers/config_parser.py` | **Configuration Parser.** Parses WSO2 `deployment.toml` (using `tomllib` for accurate nested tables), `*.xml`, `*.properties`, and `application.yml`. Creates `Configuration` nodes and `READS_CONFIG` edges. |
 | `parsers/osgi_parser.py` | **OSGi Declarative Services Parser (Sprint 2).** Scans Java for `@Component(service={...})` and `@Reference` annotations. Builds `[:RESOLVES_TO]` edges from injected interface fields to their OSGi implementation classes. Resolves service bindings invisible to normal call-graph analysis. |
-| `parsers/rfc_parser.py` | **RFC Specification Grounding Parser (Sprint 4).** Parses RFC markdown/text files from `./rfcs/` into `(:Specification)` nodes. Scans Java source for inline RFC citations (e.g. `// RFC 6749`, `// See RFC 7519`) and creates `[:IMPLEMENTS_SPEC]` edges linking classes to the specifications they implement. |
+| `parsers/rfc_parser.py` | **RFC Specification Parser (Sprint 4).** Parses RFC text files from `./rfcs/` into `(:Specification)` nodes. Also: (1) splits each RFC into numbered sections (`chunk_rfc_sections()`) for use by the semantic matcher; (2) scans Java source for any explicit RFC citations as a supplementary pass. |
+| `parsers/rfc_semantic_matcher.py` | **LLM-Verified RFC→Code Mapper.** Two-stage pipeline: Stage 1 queries ChromaDB `code_intent` to retrieve top-5 candidate Java classes per RFC section; Stage 2 sends one GPT-4o-mini call per section with the requirement text + candidates, and the LLM decides which candidates genuinely implement the requirement. Returns `SpecImplementsEdge` objects with `match_type="llm"` and `similarity_score` (LLM confidence). Handles the reality that enterprise codebases almost never contain explicit RFC citation comments. |
 
 ---
 
@@ -554,7 +601,7 @@ previous regex-based parser would miss or mislabel nested sections.
 |---|---|
 | `graph/__init__.py` | Makes `graph` a Python package. |
 | `graph/schema.py` | **Neo4j schema setup.** Creates uniqueness constraints and indexes. Includes indexes for `visibility`, `lifecycle_role`, and a `Specification` uniqueness constraint on `spec_id`. |
-| `graph/loader.py` | **Neo4j bulk loader.** Writes UIR objects to Neo4j using MERGE (idempotent). Handles `json.dumps()` for annotation serialization. Writes all v2 fields (visibility, modifiers, lifecycle). Sprint 2 additions: `load_resolves_to_edges()`, `load_specification_nodes()`, `load_implements_spec_edges()`. |
+| `graph/loader.py` | **Neo4j bulk loader.** Writes UIR objects to Neo4j using MERGE (idempotent). Handles `json.dumps()` for annotation serialization. Writes all v2 fields (visibility, modifiers, lifecycle). Sprint 2 additions: `load_resolves_to_edges()`, `load_specification_nodes()`, `load_implements_spec_edges()`. `[:IMPLEMENTS_SPEC]` edges now store `match_type` ("citation" or "llm") and `similarity_score` (LLM confidence 0–1) for traceability. |
 | `graph/gds_client.py` | **Neo4j GDS client.** Runs Leiden community detection dynamically (only projects relationship types that actually exist, preventing crashes on partial ingests). |
 | `graph/cleanup.py` | **Incremental cleanup.** Removes stale nodes when a file changes. Does NOT wipe the whole database. |
 | `graph/tagger.py` | **EntryPoint/DataSink Tagger.** Labels API endpoints as `:EntryPoint` and DAO/Repository classes as `:DataSink` for flow extraction. |
@@ -635,7 +682,7 @@ previous regex-based parser would miss or mislabel nested sections.
 
 | File | What it does |
 |---|---|
-| `rfcs/*.md` or `rfcs/*.txt` | Place RFC markdown/text files here to enable specification grounding. `parsers/rfc_parser.py` will parse them and link them to Java code that cites them. |
+| `rfcs/*.txt` | Place RFC text files here to enable specification grounding. Currently contains 14 OAuth/JWT/OIDC RFCs (6749, 6750, 7009, 7519, 7521, 7523, 7591, 7592, 7636, 7662, 8628, 8693, 8705, 9068). Each file is split into numbered sections; each section is verified against Java classes via ChromaDB + GPT-4o-mini. No explicit RFC citations in Java source are needed. |
 
 ---
 
@@ -737,7 +784,7 @@ OLLAMA_MODEL=llama3.2:3b
 5. Loads all nodes and edges into Neo4j (with visibility, lifecycle, and annotation properties)
 6. Runs OSGi resolution — builds `[:RESOLVES_TO]` edges from `@Component`/`@Reference` annotations
 7. Embeds all method chunks into ChromaDB (standard or GPU-accelerated)
-8. Parses RFC files and creates `(:Specification)` nodes + `[:IMPLEMENTS_SPEC]` edges
+8. Parses RFC files → `(:Specification)` nodes; for each numbered RFC section, retrieves top-5 candidate Java classes from ChromaDB, then calls GPT-4o-mini to verify which candidates implement the requirement → `[:IMPLEMENTS_SPEC]` edges (with LLM confidence score)
 9. Generates Ollama micro-drafts for `:EntryPoint` components (if enabled)
 10. Runs Leiden community detection
 11. Generates GPT-4o-mini (fast model) summaries for each community
@@ -783,9 +830,11 @@ Python 3.11 or higher is required (for `tomllib` in the standard library). Pytho
 `python` may not be in PATH on some Windows setups. `py` always works.
 
 **Q: How much does OpenAI cost to run?**
-Two things call OpenAI: community summarisation (once per ingest, fast model) and the final
-reduce step (once per query, strong model). A typical ingest of 2 repos costs ~$0.05–$0.20.
-Each query costs < $0.01. A full ingest of 100 repos costs ~$0.50 with the two-tier strategy.
+Three things call OpenAI during ingestion: RFC section verification (~$0.18 flat for 14 RFCs),
+community summarisation (once per ingest, fast model), and flow narrative generation.
+One thing calls OpenAI per query: the final reduce step (strong model).
+A typical ingest of 2 repos costs ~$0.25–$0.40 total (RFC verification is a fixed cost regardless of repo count).
+Each query costs < $0.01. A full ingest of 100 repos costs ~$0.70 with the two-tier strategy.
 Ollama micro-drafts cost $0 — they run entirely locally.
 
 **Q: Why does the ingestion take a long time?**
@@ -827,9 +876,13 @@ These edges make OSGi wiring visible in the graph — without them, the call gra
 gaps wherever OSGi dependency injection is used.
 
 **Q: What are `[:IMPLEMENTS_SPEC]` edges?**
-Links from a Java class to an RFC specification node (e.g. `(:Specification {rfc_number: "6749"})`).
-Created when `parsers/rfc_parser.py` finds inline RFC citations (`// RFC 6749`) in Java source code.
-Enables spec-grounded queries like "which classes implement OAuth 2.0 token exchange?".
+Links from a Java class to an RFC specification node (e.g. `(:Specification {rfc_number: 8693})`).
+Created by `parsers/rfc_semantic_matcher.py` using a two-stage process: ChromaDB retrieves top
+candidate classes for each RFC section, then GPT-4o-mini verifies which candidates genuinely
+implement the requirement. The edge stores `match_type="llm"`, `similarity_score` (0–1 LLM
+confidence), and `citation_context` (e.g. "RFC 8693 §2.1: Token Exchange Request — ...").
+This approach works even when the Java source has zero RFC citation comments — which is the norm
+in enterprise codebases like WSO2.
 
 **Q: Why are annotations stored as JSON strings in Neo4j?**
 Neo4j cannot natively store a list of maps (objects) as a node property. So `list[dict]`
@@ -917,16 +970,49 @@ vectorstore.chunker — Generated 5231 chunks from 3847 methods (avg 1.36 chunks
 → Sprint 1: Sliding window chunker. Methods >512 tokens produced multiple chunks.
 
 ```
-Batches: 100%|████████████| 57/57 [02:14<00:00,  2.34s/it]
-vectorstore.embedder — Upserted 5231 code_logic chunks
+httpx — HTTP Request: POST http://localhost:8000/api/v2/.../upsert "HTTP/1.1 200 OK"
+Batches: 100%|████████████| 16/16 [00:09<00:00,  1.72it/s]
+httpx — HTTP Request: POST http://localhost:8000/api/v2/.../upsert "HTTP/1.1 200 OK"
 ```
-→ Stage 3 (ChromaDB): HuggingFace model (or FastEmbed/Nomic if GPU enabled) converted each chunk to a vector.
+→ **This is the ChromaDB embedding phase — the slowest part of ingestion.**
+
+Breaking this down line by line:
+
+- `httpx — POST .../upsert "HTTP/1.1 200 OK"` → ChromaDB received and stored the previous batch successfully
+- `Batches: 100%|████| 16/16 [00:09<00:00, 1.72it/s]` → The HuggingFace model is running **on your CPU**, converting Java method text into 384-dimensional number vectors. `16/16` = 16 batches completed. `1.72it/s` = 1.72 batches per second. `00:09` = 9 seconds elapsed.
+- The next `httpx — POST .../upsert` line → the next batch of vectors has been uploaded
+
+**Why it repeats many times:** This progress bar appears once per embedding batch group, and this phase runs **twice per repo** — once for `code_logic` (method body text) and once for `code_intent` (Javadoc text). With two large repos you can see 50–100+ of these.
+
+**Why it's slow:** The `all-MiniLM-L6-v2` neural network is doing real matrix multiplication on every code chunk. On CPU at ~1.72 batches/sec with `EMBEDDING_BATCH_SIZE=500`, each batch holds up to 500 method chunks. 16 batches = up to 8,000 chunks embedded in 9 seconds.
+
+**How to make it faster:**
+```bash
+# Option 1 — GPU (5–10× faster, requires NVIDIA CUDA):
+py -m pip install fastembed-gpu onnxruntime-gpu
+# Then in .env:
+USE_FASTEMBED=true
+
+# Option 2 — CPU-only Nomic (slightly better model than MiniLM, similar speed):
+py -m pip install fastembed onnxruntime
+USE_FASTEMBED=true
+```
 
 ```
-parsers.rfc_parser — Parsed 3 RFC files → 3 Specification nodes
-parsers.rfc_parser — Detected 24 IMPLEMENTS_SPEC citations in Java source
+vectorstore.embedder — Upserted 5231 code_logic chunks
 ```
-→ Sprint 4: RFC specification grounding complete.
+→ Stage 3 (ChromaDB): All chunks embedded and stored. The number shows total chunks across all batches.
+
+```
+parsers.rfc_parser — Parsed 14 RFC specification files from ./rfcs
+parsers.rfc_parser — Chunked 847 RFC sections from 14 specifications
+parsers.rfc_parser — Detected 0 [:IMPLEMENTS_SPEC] citation edges across 4821 Java files
+parsers.rfc_semantic_matcher — RFC LLM matching: 847 sections queried → 312 unique IMPLEMENTS_SPEC edges (confidence≥0.70)
+pipeline.orchestrator — RFCs: 14 specifications, 0 citation edges + 312 LLM-verified edges = 312 total IMPLEMENTS_SPEC edges
+```
+→ Sprint 4: RFC specification grounding complete. "0 citation edges" is normal — WSO2 source
+  doesn't contain explicit `// RFC XXXX` comments. The 312 LLM-verified edges were found by
+  ChromaDB retrieval + GPT-4o-mini verification across all 847 numbered RFC sections.
 
 ```
 llm.local_drafting — Drafted micro_draft for 18 EntryPoint components via Ollama

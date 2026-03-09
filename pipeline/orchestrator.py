@@ -23,6 +23,7 @@ from parsers.sql_schema_parser import SQLSchemaParser
 from parsers.config_parser import ConfigurationParser
 from parsers.osgi_parser import OSGiParser
 from parsers.rfc_parser import RFCParser
+from parsers.rfc_semantic_matcher import RFCSemanticMatcher
 from linker.maven_resolver import MavenResolver
 from linker.api_bridge import ApiBridgeDetector
 from graph.schema import apply_schema
@@ -30,8 +31,9 @@ from graph.loader import Neo4jLoader
 from graph.gds_client import GDSClient
 from graph.tagger import NodeTagger
 from graph.flow_extractor import FlowExtractor
-from vectorstore.chunker import UIRChunker
+from vectorstore.chunker import UIRChunker, EmbeddingChunk
 from vectorstore.embedder import ChromaEmbedder
+from pipeline.ingest import run_parallel_parse
 from community.summarizer import CommunitySummarizer
 from community.global_rollup import GlobalRollup
 from reasoning.flow_summarizer import FlowNarrativeSummarizer
@@ -136,6 +138,11 @@ class IngestionPipeline:
         repo_module_data: list[tuple[str, list]] = []  # (mod_geid, dep_edges)
 
         for repo_path in local_paths:
+            repo_path = repo_path.resolve()  # absolute path — avoids Windows MAX_PATH on deep Java trees
+            # On Windows, use \\?\ prefix so file I/O bypasses 260-char MAX_PATH
+            import sys as _sys
+            if _sys.platform == "win32":
+                repo_path = Path("\\\\?\\" + str(repo_path))
             repo_name = repo_path.name
             java_files = list(repo_path.rglob("*.java"))
             all_java_files.extend(java_files)
@@ -154,19 +161,24 @@ class IngestionPipeline:
             proj_geid = generate_geid(repo_name, repo_name)
             mod_geid  = generate_geid(repo_name, module_info.get("artifact_id", repo_name))
 
-            # Parse all Java files
+            # Parse all Java files — parallel across CPU cores (Sprint 1)
+            comp_dicts, chunk_dicts, parse_errors = run_parallel_parse(java_files, repo_name)
+            for fp, err in parse_errors:
+                logger.warning("Failed to parse %s: %s", fp, err)
+
+            # Reconstruct UIR objects from serialized worker output
             components: list[Component] = []
-            for jf in java_files:
-                try:
-                    comps = self.java_parser.parse_file(jf, repo_name)
-                    components.extend(comps)
-                    for comp in comps:
-                        fqn_map[str(jf)] = comp.fqn
-                        for lu in comp.logic_units:
-                            geid_map[lu.fqn] = lu.geid
-                            all_logic_units.append(lu)
-                except Exception as e:
-                    logger.warning("Failed to parse %s: %s", jf, e)
+            for cd in comp_dicts:
+                from parsers.uir import Parameter, FieldDeclaration
+                lus = [LogicUnit(**{**ld, "parameters": [Parameter(**p) for p in ld.get("parameters", [])]})
+                       for ld in cd.get("logic_units", [])]
+                fields = [FieldDeclaration(**f) for f in cd.get("fields", [])]
+                comp = Component(**{**cd, "logic_units": lus, "fields": fields})
+                components.append(comp)
+                fqn_map[cd.get("file_path", "")] = comp.fqn
+                for lu in comp.logic_units:
+                    geid_map[lu.fqn] = lu.geid
+                    all_logic_units.append(lu)
 
             all_components.extend(components)
             stats["components"]  += len(components)
@@ -193,11 +205,9 @@ class IngestionPipeline:
             self.loader.load_project(project)
             repo_module_data.append((mod_geid, dep_edges))
 
-            # ── Stage 4b: Embed into ChromaDB ─────────────────────────────────
-            all_chunks = []
-            for comp in components:
-                all_chunks.extend(self.chunker.chunk_all(comp.logic_units, repo_name))
-            self.embedder.upsert_chunks(all_chunks)
+            # ── Stage 4b: Embed into ChromaDB (chunks already built by workers) ──
+            embed_chunks = [EmbeddingChunk(**cd) for cd in chunk_dicts]
+            self.embedder.upsert_chunks(embed_chunks)
 
             # ── Stage 2b: Scan SQL schemas + Config files (Sprint 2) ─────────
             db_tables = self.sql_parser.scan_sql_scripts(repo_path, repo_name)
@@ -240,14 +250,30 @@ class IngestionPipeline:
         rfc_specs = self.rfc_parser.parse_rfc_files(settings.rfc_path)
         if rfc_specs:
             self.loader.load_specification_nodes(rfc_specs)
-            rfc_edges = self.rfc_parser.detect_rfc_citations(
+
+            # Pass 1: explicit RFC citations in comments/Javadoc (rarely found)
+            citation_edges = self.rfc_parser.detect_rfc_citations(
                 all_java_files, all_components,
             )
-            if rfc_edges:
-                self.loader.load_implements_spec_edges(rfc_edges)
+
+            # Pass 2: LLM-verified matching — ChromaDB retrieval + GPT-4o-mini
+            # verification.  ChromaDB narrows the field to top-5 candidates per
+            # RFC section; the LLM reads both the spec requirement and the class
+            # description and decides which ones genuinely implement it.
+            rfc_sections = self.rfc_parser.chunk_rfc_sections(rfc_specs)
+            llm_matcher = RFCSemanticMatcher(self.embedder)
+            llm_edges = llm_matcher.match(rfc_sections)
+
+            all_rfc_edges = citation_edges + llm_edges
+            if all_rfc_edges:
+                self.loader.load_implements_spec_edges(all_rfc_edges)
             logger.info(
-                "RFCs: %d specifications, %d IMPLEMENTS_SPEC edges",
-                len(rfc_specs), len(rfc_edges) if rfc_specs else 0,
+                "RFCs: %d specifications, %d citation edges + %d LLM-verified edges "
+                "= %d total IMPLEMENTS_SPEC edges",
+                len(rfc_specs),
+                len(citation_edges),
+                len(llm_edges),
+                len(all_rfc_edges),
             )
 
         # ── Stage 3: Link (cross-repo, all nodes loaded first) ───────────────
