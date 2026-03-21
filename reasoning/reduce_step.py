@@ -66,7 +66,10 @@ _NARRATIVE_RE = re.compile(
     r'explain how|explain the flow|explain the process|explain the sequence|'
     r'from start|beginning to end|step by step|step-by-step|'
     r'full picture|overall flow|full journey|complete flow|'
-    r'how this implements|how the .+ implements|how it implements)\b',
+    r'how this implements|how the .+ implements|how it implements|'
+    r'overall architecture|overarching architecture|system architecture|'
+    r'architecture overview|architectural overview|high.level architecture|'
+    r'system overview|what is the architecture|describe the architecture)\b',
     re.IGNORECASE,
 )
 
@@ -123,6 +126,43 @@ SYSTEM_IMPACT = (
     "Your review MUST reference the specific file names and line numbers from the grep evidence. "
     "Do NOT use generic placeholders. Generate a concrete, actionable impact analysis."
 )
+
+SYSTEM_GLOBAL = (
+    "You are a senior solutions architect synthesizing a global architecture overview "
+    "from pre-computed community summaries of a WSO2 Identity Server codebase.\n\n"
+    "You have been given hierarchical GraphRAG summaries (L1 community → L2 subsystem → "
+    "L3 global). These summaries were generated from actual code analysis.\n\n"
+    "YOUR JOB: Produce a clear, structured architecture overview answering the developer's "
+    "question. Use the subsystem summaries as your primary evidence.\n\n"
+    "STRUCTURE:\n"
+    "1. **System Purpose** — What this system does and who uses it.\n"
+    "2. **Core Subsystems** — The major architectural domains (auth, token management, "
+    "persistence, etc.) and what each is responsible for.\n"
+    "3. **Key Flows** — The most important data/request flows through the system.\n"
+    "4. **Integration Points** — How subsystems connect to each other and to external systems.\n"
+    "5. **Design Patterns** — Notable architectural patterns visible across the codebase.\n\n"
+    "RULES:\n"
+    "- Reference specific subsystem names and class names from the summaries.\n"
+    "- Be concrete and specific — name actual classes, interfaces, and packages.\n"
+    "- Do not invent behaviour beyond what the summaries describe.\n"
+    "- This is an architecture overview — you MAY synthesize across subsystems."
+)
+
+TEMPLATE_GLOBAL = """
+## Question
+{query}
+
+## Global Architecture Summary (L3 — synthesized from all communities)
+{global_summary}
+
+## Subsystem Summaries (L2 — domain-level breakdowns)
+{subsystem_summaries}
+
+---
+
+Answer the question using the architectural summaries above.
+Be specific: name subsystems, key classes, and how they relate.
+""".strip()
 
 SYSTEM_GENERAL = (
     "You are a code analysis assistant for WSO2 Java repositories. "
@@ -524,6 +564,7 @@ class ReduceStep:
         query: str = "",
         primary_targets: list[dict] | None = None,
         code_snippets: list | None = None,    # CodeSnippet objects from CodeFetcher
+        route: str = "",
     ) -> str:
         """
         Execute the reduce step with intent-aware prompting.
@@ -533,7 +574,12 @@ class ReduceStep:
             query:           Original user query
             primary_targets: Grounded evidence (grep hits, graph nodes, semantic hits)
             code_snippets:   Actual source code blocks from CodeFetcher
+            route:           Router decision (global/global_l2 triggers architecture prompt)
         """
+        # Global architecture queries use a dedicated synthesis prompt
+        if route.startswith("global") and map_results:
+            return self._run_global(map_results, query)
+
         targets    = primary_targets or []
         intent     = self._detect_intent(query)
         if intent == "safety":
@@ -639,6 +685,43 @@ class ReduceStep:
             community_summaries=summaries_text,
         )
         return len(_ENCODER.encode(SYSTEM_IMPACT + prompt))
+
+    def _run_global(self, map_results: list[MapResult], query: str) -> str:
+        """Dedicated path for global/architecture overview queries."""
+        # Separate L3 global doc from L2 subsystem summaries
+        global_parts = []
+        subsystem_parts = []
+        for mr in map_results:
+            meta = {}
+            # MapResult doesn't carry metadata directly — use summary text heuristics
+            text = mr.summary_text or ""
+            if mr.community_id == -1 and "Global Architecture" in text[:200]:
+                global_parts.append(text)
+            elif mr.community_id == -1:
+                subsystem_parts.append(text)
+            else:
+                subsystem_parts.append(text)
+
+        global_summary = "\n\n".join(global_parts) if global_parts else "(no L3 global summary available)"
+        subsystem_summaries = "\n\n---\n\n".join(subsystem_parts[:8]) if subsystem_parts else "(no L2 subsystem summaries available)"
+
+        prompt = TEMPLATE_GLOBAL.format(
+            query=query or "(architecture overview)",
+            global_summary=global_summary,
+            subsystem_summaries=subsystem_summaries,
+        )
+
+        response = self.llm.chat.completions.create(
+            model=settings.llm_model,
+            messages=[
+                {"role": "system", "content": SYSTEM_GLOBAL},
+                {"role": "user",   "content": prompt},
+            ],
+            max_completion_tokens=NARRATIVE_RESERVE,
+        )
+        answer = response.choices[0].message.content.strip()
+        logger.info("Global reduce complete — %d chars", len(answer))
+        return answer
 
     # ── Private ────────────────────────────────────────────────────────────────
 

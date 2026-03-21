@@ -100,6 +100,22 @@ class Settings(BaseSettings):
         default=3,
         description="Max graph-traversal hops for blast-radius computation.",
     )
+    blast_radius_max_depth: int = Field(
+        default=3,
+        description="BFS depth for precomputed blast radius (depth_1/2/3 groupings).",
+    )
+    blast_radius_precompute_enabled: bool = Field(
+        default=False,
+        description="Precompute blast_radius_json on all nodes at ingest time (expensive).",
+    )
+    rrf_k: int = Field(
+        default=60,
+        description="RRF constant K — higher reduces influence of top ranks.",
+    )
+    hybrid_search_n_results: int = Field(
+        default=20,
+        description="Number of candidates per source in hybrid search.",
+    )
     router_confidence_threshold: float = Field(
         default=0.7,
         description="Minimum classifier confidence to accept a symbolic/exact route.",
@@ -188,6 +204,27 @@ class Settings(BaseSettings):
         default=Path("./rfcs"),
         description="Path to IETF RFC markdown files for specification grounding.",
     )
+    rfc_distance_primary: float = Field(
+        default=0.65,
+        description="ChromaDB distance cutoff for high-confidence RFC candidate retrieval.",
+    )
+    rfc_distance_secondary: float = Field(
+        default=0.85,
+        description="ChromaDB distance cutoff for borderline RFC candidates passed to LLM with a lower-confidence flag.",
+    )
+
+    # ── API Server ────────────────────────────────────────────────────────────
+    api_host: str = Field(default="0.0.0.0", description="API server bind host.")
+    api_port: int = Field(default=8080, description="API server port.")
+    api_keys: str = Field(
+        default="",
+        description="Comma-separated API keys for bearer auth. Empty = no auth (dev mode).",
+    )
+
+    @property
+    def api_key_set(self) -> set[str]:
+        """Parsed set of valid API keys (empty = auth disabled)."""
+        return {k.strip() for k in self.api_keys.split(",") if k.strip()}
 
     # ── Ollama / Local LLM (Sprint 4) ─────────────────────────────────────────
     ollama_base_url: str = Field(

@@ -60,6 +60,7 @@ class RFCSection:
     section_number: str   # e.g. "4.1"
     section_title: str    # e.g. "Authorization Code Grant"
     body_text: str        # full section text (header + body)
+    spec_id: str = ""     # unique section key e.g. "RFC6749-4.1"
 
 
 @dataclass
@@ -69,8 +70,10 @@ class SpecImplementsEdge:
     component_fqn: str
     rfc_number: int
     citation_context: str  # surrounding comment text or matched section title
-    match_type: str = "citation"   # "citation" | "semantic"
+    match_type: str = "citation"   # "citation" | "semantic" | "llm"
     similarity_score: float = 1.0  # 1.0 for citations; cosine sim for semantic
+    section_spec_id: str = ""      # e.g. "RFC6749-4.1" — section-granular binding
+    section_title: str = ""        # e.g. "Authorization Code Grant"
 
 
 class RFCParser:
@@ -152,6 +155,7 @@ class RFCParser:
                     section_number=sec_num,
                     section_title=sec_title,
                     body_text=full_text,
+                    spec_id=f"RFC{spec.rfc_number}-{sec_num}",
                 ))
 
         logger.info(

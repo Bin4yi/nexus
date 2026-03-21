@@ -53,6 +53,11 @@ pyyaml>=6.0
 # ── CLI framework ────────────────────────────────────────────────────────────
 click>=8.0
 
+# ── REST API (P0.1) ──────────────────────────────────────────────────────────
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+httpx>=0.27         # async HTTP client (used by CI integration + health checks)
+
 # ── Testing ──────────────────────────────────────────────────────────────────
 pytest>=7.0
 pytest-timeout>=2.0

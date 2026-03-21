@@ -15,6 +15,7 @@ a research-grade sliding window algorithm:
          (only one intent chunk per method, not per window)
 """
 from __future__ import annotations
+import re
 from dataclasses import dataclass
 
 import tiktoken
@@ -102,6 +103,66 @@ def _sliding_window(text: str, chunk_size: int, overlap: int) -> list[str]:
     return windows
 
 
+_METHOD_CALL_RE = re.compile(r"\.(\w{3,})\s*\(")
+_STRING_LITERAL_RE = re.compile(r'"([A-Za-z0-9_.:/\-]{4,40})"')
+_FIELD_ACCESS_RE = re.compile(r"\.([A-Z_]{4,})\b")
+
+
+def _synthesize_intent(lu: "LogicUnit") -> str:
+    """
+    Synthesize a rich intent string for methods that lack Javadoc by
+    extracting semantic signals from the method body.
+
+    Signals extracted (no LLM required):
+      1. Method signature  — name + parameter types + return type
+      2. Called methods    — what this method delegates to
+                             (.validateToken, .getAccessToken, .persist)
+      3. String constants  — domain terms from string literals
+                             ("grant_type", "access_token", "Bearer")
+      4. Constant refs     — ALL_CAPS field accesses
+                             (.GRANT_TYPE_AUTHORIZATION_CODE)
+
+    Example output:
+        validateScope(OAuthTokenReqMessageContext tokReqMsgCtx): boolean
+        calls: validateInternalScope, checkAllowedScopes, getRequestedScopes
+        refs: "openid", "scope", OAUTH2_SCOPE_SEPARATOR
+    """
+    method_name = lu.fqn.split("(")[0].rsplit(".", 1)[-1] if lu.fqn else ""
+    params = ", ".join(
+        f"{p.type_name} {p.name}" for p in lu.parameters
+    ) if lu.parameters else ""
+    ret = lu.return_type or "void"
+    signature = f"{method_name}({params}): {ret}"
+
+    if not lu.body_text:
+        return signature
+
+    body = lu.body_text[:3000]
+
+    # Extract called method names (deduplicated, exclude trivial getters/setters)
+    _trivial = {"get", "set", "is", "has", "add", "put", "log", "equals", "toString"}
+    called = list(dict.fromkeys(
+        m for m in _METHOD_CALL_RE.findall(body)
+        if m.lower() not in _trivial
+    ))[:8]
+
+    # Extract meaningful string literals (domain terms)
+    strings = list(dict.fromkeys(_STRING_LITERAL_RE.findall(body)))[:6]
+
+    # Extract ALL_CAPS constant references (e.g. GRANT_TYPE_AUTHORIZATION_CODE)
+    constants = list(dict.fromkeys(_FIELD_ACCESS_RE.findall(body)))[:5]
+
+    parts = [signature]
+    if called:
+        parts.append("calls: " + ", ".join(called))
+    if strings:
+        parts.append("refs: " + ", ".join(f'"{s}"' for s in strings))
+    if constants:
+        parts.append("consts: " + ", ".join(constants))
+
+    return "\n".join(parts)
+
+
 class UIRChunker:
     """
     Converts LogicUnit UIR objects into EmbeddingChunk objects using
@@ -156,19 +217,22 @@ class UIRChunker:
         if lu.docstring.strip():
             parsed = _javadoc.parse(lu.docstring)
             intent_text = _javadoc.format_for_embedding(parsed)
-            if intent_text.strip():
-                # Prefix intent too — a semantic query should know which class
-                # the intent belongs to
-                chunks.append(EmbeddingChunk(
-                    chunk_id=f"{lu.geid}_code_intent",
-                    geid=lu.geid,
-                    fqn=lu.fqn,
-                    text=prefix + intent_text,
-                    chunk_type="code_intent",
-                    file_path=lu.file_path,
-                    start_line=lu.start_line,
-                    end_line=lu.end_line,
-                ))
+        else:
+            intent_text = _synthesize_intent(lu)
+
+        if intent_text.strip():
+            # Prefix intent too — a semantic query should know which class
+            # the intent belongs to
+            chunks.append(EmbeddingChunk(
+                chunk_id=f"{lu.geid}_code_intent",
+                geid=lu.geid,
+                fqn=lu.fqn,
+                text=prefix + intent_text,
+                chunk_type="code_intent",
+                file_path=lu.file_path,
+                start_line=lu.start_line,
+                end_line=lu.end_line,
+            ))
 
         return chunks
 

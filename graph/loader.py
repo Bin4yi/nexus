@@ -21,6 +21,14 @@ from parsers.config_parser import ConfigurationInfo, ConfigReadEdge
 
 logger = logging.getLogger(__name__)
 
+# ── Confidence tier constants ─────────────────────────────────────────────────
+# Every relationship in the graph carries a confidence score (0.0–1.0) and a
+# resolution_tier string so queries can filter out low-confidence inferred edges.
+TIER_EXPLICIT   = ("explicit",   1.0)   # @Override, direct import, annotation-driven
+TIER_STRUCTURAL = ("structural", 0.9)   # AST call expression, direct CALLS
+TIER_HEURISTIC  = ("heuristic",  0.7)   # type inference, INJECTS/RETURNS/RECEIVES
+TIER_INFERRED   = ("inferred",   0.5)   # cross-file inference, RESOLVES_TO, INSTANTIATES
+
 # Retry decorator for transient Neo4j failures
 _loader_retry = retry(
     retry=retry_if_exception_type((ServiceUnavailable, SessionExpired, ConnectionError)),
@@ -76,7 +84,8 @@ class Neo4jLoader:
                     WHERE tgt.artifact_id = $artifact_id
                       AND tgt.group_id = $group_id
                     MERGE (src)-[r:DEPENDS_ON]->(tgt)
-                    SET r.scope = $scope, r.version = $version
+                    SET r.scope = $scope, r.version = $version,
+                        r.confidence = 1.0, r.resolution_tier = 'explicit'
                     """,
                     src_geid=source_module_geid,
                     artifact_id=dep.target_artifact_id,
@@ -115,7 +124,8 @@ class Neo4jLoader:
                         'UNWIND $pairs AS pair RETURN pair',
                         'MATCH (src:Component {geid: pair.src_geid})
                          MATCH (tgt:Component {fqn: pair.tgt_fqn})
-                         MERGE (src)-[:IMPLEMENTS]->(tgt)',
+                         MERGE (src)-[r:IMPLEMENTS]->(tgt)
+                         SET r.confidence = 1.0, r.resolution_tier = "explicit"',
                         {batchSize: $batch_size, params: {pairs: $pairs}}
                     )
                     """,
@@ -131,7 +141,8 @@ class Neo4jLoader:
                         'UNWIND $pairs AS pair RETURN pair',
                         'MATCH (src:Component {geid: pair.src_geid})
                          MATCH (tgt:Component {fqn: pair.tgt_fqn})
-                         MERGE (src)-[:EXTENDS]->(tgt)',
+                         MERGE (src)-[r:EXTENDS]->(tgt)
+                         SET r.confidence = 1.0, r.resolution_tier = "explicit"',
                         {batchSize: $batch_size, params: {pairs: $pairs}}
                     )
                     """,
@@ -165,16 +176,107 @@ class Neo4jLoader:
                 CALL apoc.periodic.iterate(
                     'UNWIND $pairs AS pair RETURN pair',
                     'MATCH (caller:LogicUnit {geid: pair.caller_geid})
-                     MATCH (target:LogicUnit {fqn: pair.target_fqn})
+                     OPTIONAL MATCH (target:LogicUnit {fqn: pair.target_fqn})
+                     WITH caller, target, pair
+                     WHERE target IS NOT NULL
                      MERGE (caller)-[r:CALLS]->(target)
-                     SET r.call_site = pair.call_site',
+                     SET r.call_site = pair.call_site,
+                         r.confidence = 0.9, r.resolution_tier = "structural"',
                     {batchSize: $batch_size, params: {pairs: $pairs}}
                 )
                 """,
                 pairs=call_pairs,
                 batch_size=settings.batch_size,
             ).consume()
-            logger.info("Loaded %d CALLS edges", len(call_pairs))
+
+            # Fallback: match short names (ClassName.method) using ENDS WITH
+            short_pairs = [p for p in call_pairs if "." in p["target_fqn"] and p["target_fqn"].count(".") == 1]
+            if short_pairs:
+                session.run(
+                    """
+                    CALL apoc.periodic.iterate(
+                        'UNWIND $pairs AS pair RETURN pair',
+                        'MATCH (caller:LogicUnit {geid: pair.caller_geid})
+                         MATCH (target:LogicUnit)
+                         WHERE target.fqn ENDS WITH ("." + pair.target_fqn)
+                            OR target.fqn = pair.target_fqn
+                         WITH caller, target, pair LIMIT 1
+                         MERGE (caller)-[r:CALLS]->(target)
+                         SET r.call_site = pair.call_site,
+                             r.confidence = 0.7, r.resolution_tier = "heuristic"',
+                        {batchSize: $batch_size, params: {pairs: $short_pairs}}
+                    )
+                    """,
+                    short_pairs=short_pairs,
+                    batch_size=settings.batch_size,
+                ).consume()
+
+            actual = session.run("MATCH ()-[r:CALLS]->() RETURN count(r) AS c").single()["c"]
+            logger.info("Loaded %d CALLS call-pairs → %d edges in Neo4j", len(call_pairs), actual)
+
+    def load_unresolved_calls(self, logic_units: list[LogicUnit]) -> None:
+        """
+        Cross-repo CALLS edge resolution — Pass 2.
+
+        After load_call_graph() creates exact-FQN and ENDS-WITH edges, some
+        call targets remain unresolved because the callee lives in a different
+        repo and its simple name (e.g. "TokenGrantHandler") doesn't form an
+        exact match.
+
+        This pass tries suffix matching with at least 3 FQN segments so that
+        "org.wso2.carbon.identity.oauth2.token.handlers.TokenGrantHandler"
+        matches a call target recorded as "identity.oauth2.token.handlers.TokenGrantHandler".
+
+        Edges created here carry confidence=0.5, resolution_tier="inferred".
+        """
+        # Collect call targets that contain a dot (qualified) but might be
+        # partial — they'll have count > 1 dots and aren't already resolved
+        all_pairs = [
+            {"caller_geid": lu.geid, "target_fqn": target_fqn, "call_site": lu.file_path}
+            for lu in logic_units
+            for target_fqn in lu.calls
+            if target_fqn.count(".") >= 2   # at least pkg.Class.method
+        ]
+        if not all_pairs:
+            return
+
+        with self.driver.session() as session:
+            # Only process pairs that don't already have a CALLS edge
+            session.run(
+                """
+                CALL apoc.periodic.iterate(
+                    'UNWIND $pairs AS pair RETURN pair',
+                    'MATCH (caller:LogicUnit {geid: pair.caller_geid})
+                     WHERE NOT (caller)-[:CALLS]->()
+                         OR NOT EXISTS {
+                             MATCH (caller)-[:CALLS]->(t:LogicUnit)
+                             WHERE t.fqn ENDS WITH pair.target_fqn
+                         }
+                     MATCH (target:LogicUnit)
+                     WHERE target.fqn ENDS WITH ("." + pair.target_fqn)
+                        OR target.fqn ENDS WITH pair.target_fqn
+                     WITH caller, target, pair
+                     WHERE caller <> target
+                     MERGE (caller)-[r:CALLS]->(target)
+                     ON CREATE SET r.call_site = pair.call_site,
+                                   r.confidence = 0.5,
+                                   r.resolution_tier = "inferred",
+                                   r.cross_repo = true',
+                    {batchSize: $batch_size, params: {pairs: $pairs}}
+                )
+                """,
+                pairs=all_pairs,
+                batch_size=settings.batch_size,
+            ).consume()
+
+        with self.driver.session() as session:
+            cross = session.run(
+                "MATCH ()-[r:CALLS {cross_repo: true}]->() RETURN count(r) AS c"
+            ).single()["c"]
+        logger.info(
+            "Cross-repo CALLS resolution: %d candidate pairs → %d inferred edges",
+            len(all_pairs), cross,
+        )
 
     def load_type_edges(self, logic_units: list[LogicUnit]) -> None:
         """
@@ -213,7 +315,8 @@ class Neo4jLoader:
                         'MATCH (lu:LogicUnit {geid: pair.lu_geid})
                          MATCH (t:Component) WHERE t.fqn ENDS WITH pair.type_fqn
                             OR t.fqn = pair.type_fqn
-                         MERGE (lu)-[:RETURNS]->(t)',
+                         MERGE (lu)-[r:RETURNS]->(t)
+                         SET r.confidence = 0.7, r.resolution_tier = "heuristic"',
                         {batchSize: $batch_size, params: {pairs: $pairs}}
                     )
                     """,
@@ -230,7 +333,8 @@ class Neo4jLoader:
                         'MATCH (lu:LogicUnit {geid: pair.lu_geid})
                          MATCH (t:Component) WHERE t.fqn ENDS WITH pair.type_fqn
                             OR t.fqn = pair.type_fqn
-                         MERGE (lu)-[:RECEIVES]->(t)',
+                         MERGE (lu)-[r:RECEIVES]->(t)
+                         SET r.confidence = 0.7, r.resolution_tier = "heuristic"',
                         {batchSize: $batch_size, params: {pairs: $pairs}}
                     )
                     """,
@@ -263,7 +367,8 @@ class Neo4jLoader:
                     'MATCH (src:Component {geid: pair.src_geid})
                      MATCH (tgt:Component) WHERE tgt.fqn ENDS WITH pair.tgt_type
                         OR tgt.fqn = pair.tgt_type
-                     MERGE (src)-[:INJECTS]->(tgt)',
+                     MERGE (src)-[r:INJECTS]->(tgt)
+                     SET r.confidence = 0.7, r.resolution_tier = "heuristic"',
                     {batchSize: $batch_size, params: {pairs: $pairs}}
                 )
                 """,
@@ -299,7 +404,8 @@ class Neo4jLoader:
                         'UNWIND $pairs AS pair RETURN pair',
                         'MATCH (src:Component {geid: pair.src_geid})
                          MERGE (ann:AnnotationType {name: pair.ann_name})
-                         MERGE (src)-[:ANNOTATED_WITH]->(ann)',
+                         MERGE (src)-[r:ANNOTATED_WITH]->(ann)
+                         SET r.confidence = 1.0, r.resolution_tier = "explicit"',
                         {batchSize: $batch_size, params: {pairs: $pairs}}
                     )
                     """,
@@ -315,7 +421,8 @@ class Neo4jLoader:
                         'UNWIND $pairs AS pair RETURN pair',
                         'MATCH (lu:LogicUnit {geid: pair.lu_geid})
                          MERGE (ann:AnnotationType {name: pair.ann_name})
-                         MERGE (lu)-[:ANNOTATED_WITH]->(ann)',
+                         MERGE (lu)-[r:ANNOTATED_WITH]->(ann)
+                         SET r.confidence = 1.0, r.resolution_tier = "explicit"',
                         {batchSize: $batch_size, params: {pairs: $pairs}}
                     )
                     """,
@@ -373,7 +480,8 @@ class Neo4jLoader:
                     'MATCH (child:LogicUnit {geid: pair.lu_geid})
                      MATCH (parent:LogicUnit) WHERE parent.fqn STARTS WITH pair.parent_fqn
                         OR parent.fqn = pair.parent_fqn
-                     MERGE (child)-[:OVERRIDES]->(parent)',
+                     MERGE (child)-[r:OVERRIDES]->(parent)
+                     SET r.confidence = 1.0, r.resolution_tier = "explicit"',
                     {batchSize: $batch_size, params: {pairs: $pairs}}
                 )
                 """,
@@ -403,7 +511,8 @@ class Neo4jLoader:
                     'MATCH (lu:LogicUnit {geid: pair.lu_geid})
                      MATCH (cls:Component) WHERE cls.fqn ENDS WITH pair.cls_type
                         OR cls.fqn = pair.cls_type
-                     MERGE (lu)-[:INSTANTIATES]->(cls)',
+                     MERGE (lu)-[r:INSTANTIATES]->(cls)
+                     SET r.confidence = 0.5, r.resolution_tier = "inferred"',
                     {batchSize: $batch_size, params: {pairs: $pairs}}
                 )
                 """,
@@ -468,7 +577,8 @@ class Neo4jLoader:
                     """
                     MATCH (c:Component {geid: $geid})
                     MATCH (t:DatabaseTable {name: $table_name})
-                    MERGE (c)-[:QUERIES_TABLE]->(t)
+                    MERGE (c)-[r:QUERIES_TABLE]->(t)
+                    SET r.confidence = 0.9, r.resolution_tier = 'structural'
                     """,
                     geid=edge.component_geid,
                     table_name=edge.table_name,
@@ -505,7 +615,8 @@ class Neo4jLoader:
                     """
                     MATCH (c:Component {geid: $geid})
                     MATCH (cfg:Configuration {config_key: $config_key})
-                    MERGE (c)-[:READS_CONFIG]->(cfg)
+                    MERGE (c)-[r:READS_CONFIG]->(cfg)
+                    SET r.confidence = 0.7, r.resolution_tier = 'heuristic'
                     """,
                     geid=edge.component_geid,
                     config_key=edge.config_key,
@@ -543,7 +654,8 @@ class Neo4jLoader:
                        WHERE impl.fqn = pair.implementation_fqn
                           OR impl.fqn ENDS WITH pair.implementation_fqn
                      MERGE (iface)-[r:RESOLVES_TO]->(impl)
-                     SET r.reference_field = pair.reference_field',
+                     SET r.reference_field = pair.reference_field,
+                         r.confidence = 0.5, r.resolution_tier = "inferred"',
                     {batchSize: $batch_size, params: {pairs: $pairs}}
                 )
                 """,
@@ -567,7 +679,8 @@ class Neo4jLoader:
                     """
                     MERGE (s:Specification {rfc_number: $rfc_number})
                     SET s.title = $title,
-                        s.source_file = $source_file
+                        s.source_file = $source_file,
+                        s.spec_id = 'RFC' + toString($rfc_number)
                     """,
                     rfc_number=spec.rfc_number,
                     title=spec.title,
@@ -575,33 +688,131 @@ class Neo4jLoader:
                 ).consume()
         logger.info("Loaded %d Specification nodes", len(specs))
 
+    def load_specification_section_nodes(self, sections: list) -> None:
+        """
+        Create (:SpecSection) nodes for individual RFC sections and link them to
+        their parent (:Specification) via [:SECTION_OF].
+
+        This enables section-granular IMPLEMENTS_SPEC queries:
+          "Which classes implement RFC 6749 §4.1 Authorization Code Grant?"
+
+        ``sections`` should be a list of ``RFCSection`` objects.
+        """
+        if not sections:
+            return
+        bs = settings.batch_size
+        rows = [
+            {
+                "spec_id":        sec.spec_id,
+                "rfc_number":     sec.rfc_number,
+                "section_number": sec.section_number,
+                "section_title":  sec.section_title,
+                "body_text":      sec.body_text[:2000],  # cap to avoid huge properties
+            }
+            for sec in sections
+            if sec.spec_id  # skip sections without a spec_id
+        ]
+        with self.driver.session() as session:
+            for i in range(0, len(rows), bs):
+                batch = rows[i: i + bs]
+                session.run(
+                    """
+                    UNWIND $rows AS row
+                    MERGE (ss:SpecSection {spec_id: row.spec_id})
+                    SET ss.rfc_number     = row.rfc_number,
+                        ss.section_number = row.section_number,
+                        ss.section_title  = row.section_title,
+                        ss.body_text      = row.body_text
+                    WITH ss, row
+                    MATCH (s:Specification {rfc_number: row.rfc_number})
+                    MERGE (ss)-[:SECTION_OF]->(s)
+                    """,
+                    rows=batch,
+                ).consume()
+        logger.info("Loaded %d SpecSection nodes", len(rows))
+
     def load_implements_spec_edges(self, edges: list) -> None:
         """
-        Create [:IMPLEMENTS_SPEC] edges from Component → Specification.
-        (Sprint 4: specification grounding)
+        Create [:IMPLEMENTS_SPEC] edges from Component → Specification and
+        (when section_spec_id is present) also → SpecSection.
 
-        ``edges`` should be a list of ``SpecImplementsEdge`` objects.
+        Resolves GEIDs for both Component nodes and LogicUnit nodes:
+        if the GEID belongs to a LogicUnit, we walk up to its parent Component.
+        This handles the case where ChromaDB code_intent vectors were stored
+        with LogicUnit GEIDs (from the main ingest pass) rather than Component GEIDs.
         """
         if not edges:
             return
+
+        loaded = 0
         with self.driver.session() as session:
             for edge in edges:
-                session.run(
+                geid               = edge.component_geid
+                rfc_number         = edge.rfc_number
+                match_type         = getattr(edge, "match_type", "citation")
+                sim                = getattr(edge, "similarity_score", 1.0)
+                section_spec_id    = getattr(edge, "section_spec_id", "") or ""
+                section_title      = getattr(edge, "section_title", "") or ""
+                confidence         = 1.0 if sim >= 0.9 else (0.9 if sim >= 0.7 else 0.7)
+                resolution_tier    = "explicit" if match_type == "citation" else "structural"
+
+                # Resolve geid → Component, handling both Component and LogicUnit GEIDs.
+                # OPTIONAL MATCH both paths; coalesce picks the first non-null result.
+                result = session.run(
                     """
-                    MATCH (c:Component {geid: $geid})
+                    OPTIONAL MATCH (c1:Component {geid: $geid})
+                    OPTIONAL MATCH (lu:LogicUnit {geid: $geid})<-[:HAS_METHOD]-(c2:Component)
+                    WITH coalesce(c1, c2) AS c
+                    WHERE c IS NOT NULL
                     MATCH (s:Specification {rfc_number: $rfc_number})
                     MERGE (c)-[r:IMPLEMENTS_SPEC]->(s)
-                    SET r.citation_context = $citation_context,
-                        r.match_type = $match_type,
-                        r.similarity_score = $similarity_score
+                    SET r.citation_context  = $citation_context,
+                        r.match_type        = $match_type,
+                        r.similarity_score  = $similarity_score,
+                        r.confidence        = $confidence,
+                        r.resolution_tier   = $resolution_tier,
+                        r.section_spec_id   = $section_spec_id,
+                        r.section_title     = $section_title
+                    RETURN count(r) AS created
                     """,
-                    geid=edge.component_geid,
-                    rfc_number=edge.rfc_number,
+                    geid=geid,
+                    rfc_number=rfc_number,
                     citation_context=edge.citation_context,
-                    match_type=getattr(edge, "match_type", "citation"),
-                    similarity_score=getattr(edge, "similarity_score", 1.0),
-                ).consume()
-        logger.info("Loaded %d [:IMPLEMENTS_SPEC] edges", len(edges))
+                    match_type=match_type,
+                    similarity_score=sim,
+                    confidence=confidence,
+                    resolution_tier=resolution_tier,
+                    section_spec_id=section_spec_id,
+                    section_title=section_title,
+                )
+                rec = result.single()
+                if rec and rec["created"]:
+                    loaded += 1
+
+                    # If we have a section reference, also draw Component → SpecSection
+                    if section_spec_id:
+                        session.run(
+                            """
+                            OPTIONAL MATCH (c1:Component {geid: $geid})
+                            OPTIONAL MATCH (lu:LogicUnit {geid: $geid})<-[:HAS_METHOD]-(c2:Component)
+                            WITH coalesce(c1, c2) AS c
+                            WHERE c IS NOT NULL
+                            MATCH (ss:SpecSection {spec_id: $section_spec_id})
+                            MERGE (c)-[r:IMPLEMENTS_SPEC]->(ss)
+                            SET r.citation_context = $citation_context,
+                                r.match_type       = $match_type,
+                                r.similarity_score = $similarity_score,
+                                r.confidence       = $confidence
+                            """,
+                            geid=geid,
+                            section_spec_id=section_spec_id,
+                            citation_context=edge.citation_context,
+                            match_type=match_type,
+                            similarity_score=sim,
+                            confidence=confidence,
+                        ).consume()
+
+        logger.info("Loaded %d [:IMPLEMENTS_SPEC] edges (of %d input)", loaded, len(edges))
 
     def load_remote_calls(self, edges: list[dict[str, Any]]) -> None:
         """Create [:REMOTE_CALLS] edges from API bridge detection results."""
@@ -616,7 +827,8 @@ class Neo4jLoader:
                     MERGE (caller)-[r:REMOTE_CALLS]->(callee)
                     SET r.protocol = $protocol,
                         r.http_method = $http_method,
-                        r.path = $path
+                        r.path = $path,
+                        r.confidence = 0.7, r.resolution_tier = 'heuristic'
                     """,
                     **edge,
                 ).consume()
@@ -689,6 +901,7 @@ class Neo4jLoader:
                 l.file_path = $file_path,
                 l.start_line = $start_line, l.end_line = $end_line,
                 l.docstring = $docstring,
+                l.body_text = $body_text,
                 l.annotations = $annotations,
                 l.deprecated = $deprecated,
                 l.throws = $throws,
@@ -707,6 +920,7 @@ class Neo4jLoader:
             return_type=lu.return_type or "",
             file_path=lu.file_path, start_line=lu.start_line,
             end_line=lu.end_line, docstring=lu.docstring,
+            body_text=(lu.body_text or "")[:4000],
             annotations=json.dumps(lu.annotations), deprecated=lu.deprecated,
             throws=lu.throws, overrides=lu.overrides or "",
             visibility=lu.visibility,

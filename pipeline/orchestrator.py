@@ -144,7 +144,11 @@ class IngestionPipeline:
             if _sys.platform == "win32":
                 repo_path = Path("\\\\?\\" + str(repo_path))
             repo_name = repo_path.name
-            java_files = list(repo_path.rglob("*.java"))
+            java_files = [
+                f for f in repo_path.rglob("*.java")
+                if "src/main/java" in str(f).replace("\\", "/")
+                or "src\\main\\java" in str(f)
+            ]
             all_java_files.extend(java_files)
             stats["files_parsed"] += len(java_files)
 
@@ -251,16 +255,19 @@ class IngestionPipeline:
         if rfc_specs:
             self.loader.load_specification_nodes(rfc_specs)
 
-            # Pass 1: explicit RFC citations in comments/Javadoc (rarely found)
+            # Section-granular nodes — one (:SpecSection) per numbered section,
+            # linked to their parent (:Specification) via [:SECTION_OF].
+            rfc_sections = self.rfc_parser.chunk_rfc_sections(rfc_specs)
+            self.loader.load_specification_section_nodes(rfc_sections)
+
+            # Pass 1: explicit RFC citations in comments/Javadoc
             citation_edges = self.rfc_parser.detect_rfc_citations(
                 all_java_files, all_components,
             )
 
-            # Pass 2: LLM-verified matching — ChromaDB retrieval + GPT-4o-mini
-            # verification.  ChromaDB narrows the field to top-5 candidates per
-            # RFC section; the LLM reads both the spec requirement and the class
-            # description and decides which ones genuinely implement it.
-            rfc_sections = self.rfc_parser.chunk_rfc_sections(rfc_specs)
+            # Pass 2: LLM-verified matching — ChromaDB retrieval (top-10) +
+            # GPT-4o-mini verification.  Edges are now section-granular:
+            # each match draws Component→SpecSection as well as Component→Specification.
             llm_matcher = RFCSemanticMatcher(self.embedder)
             llm_edges = llm_matcher.match(rfc_sections)
 
@@ -268,9 +275,10 @@ class IngestionPipeline:
             if all_rfc_edges:
                 self.loader.load_implements_spec_edges(all_rfc_edges)
             logger.info(
-                "RFCs: %d specifications, %d citation edges + %d LLM-verified edges "
-                "= %d total IMPLEMENTS_SPEC edges",
+                "RFCs: %d specifications, %d sections, "
+                "%d citation edges + %d LLM-verified edges = %d total IMPLEMENTS_SPEC edges",
                 len(rfc_specs),
+                len(rfc_sections),
                 len(citation_edges),
                 len(llm_edges),
                 len(all_rfc_edges),
@@ -282,10 +290,14 @@ class IngestionPipeline:
         # Tier 1: Core relationships
         logger.info("Loading Tier 1 edges...")
 
-        # CALLS — method call graph
+        # CALLS — method call graph (Pass 1: exact FQN + ENDS WITH)
         self.loader.load_call_graph(all_logic_units)
         stats["call_edges"] = sum(len(lu.calls) for lu in all_logic_units)
-        logger.info("Stage 3a — %d CALLS edges", stats["call_edges"])
+        logger.info("Stage 3a — %d CALLS edges (pass 1: exact/ends-with)", stats["call_edges"])
+
+        # CALLS — Pass 2: cross-repo suffix matching (inferred, confidence=0.5)
+        self.loader.load_unresolved_calls(all_logic_units)
+        logger.info("Stage 3a — cross-repo CALLS pass 2 complete")
 
         # IMPLEMENTS + EXTENDS — OOP type system (2-pass: all nodes exist now)
         self.loader.load_implements_extends(all_components)

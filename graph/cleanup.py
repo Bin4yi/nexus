@@ -50,6 +50,36 @@ class GraphCleanup:
             logger.info("Deleted %d stale CALLS edges", count)
             return count
 
+    def delete_all_edges_for_geids(self, deleted_geids: list[str]) -> int:
+        """
+        Delete ALL outgoing edges (any relationship type) from changed/deleted nodes.
+        Used by the incremental updater before re-loading all 14 relationship types,
+        not just CALLS.
+
+        Args:
+            deleted_geids: GEIDs of nodes whose outgoing edges should be cleared
+
+        Returns:
+            Total number of edges deleted across all relationship types
+        """
+        if not deleted_geids:
+            return 0
+
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (n)-[r]->()
+                WHERE n.geid IN $geids
+                  AND (n:LogicUnit OR n:Component)
+                DELETE r
+                RETURN count(r) AS deleted
+                """,
+                geids=deleted_geids,
+            )
+            count = result.single()["deleted"]
+            logger.info("Deleted %d stale edges (all types) for %d nodes", count, len(deleted_geids))
+            return count
+
     def delete_nodes_for_files(self, deleted_file_paths: list[str]) -> int:
         """
         Remove all LogicUnit and Component nodes belonging to deleted files.

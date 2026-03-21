@@ -75,6 +75,8 @@ def build_call_fqn(
     """
     if receiver_type:
         if package_hint:
-            return f"{package_hint}.{receiver_type}.{method_name}"
+            # package_hint is the full class FQN from imports (e.g. "com.example.Foo")
+            # — do NOT add receiver_type again (that would double the class name)
+            return f"{package_hint}.{method_name}"
         return f"{receiver_type}.{method_name}"
     return method_name

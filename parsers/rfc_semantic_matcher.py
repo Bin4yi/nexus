@@ -38,11 +38,13 @@ from parsers.rfc_parser import RFCSection, SpecImplementsEdge
 logger = logging.getLogger(__name__)
 
 # Stage 1: retrieve this many candidates per RFC section from ChromaDB
-_RETRIEVAL_TOP_K = 5
+_RETRIEVAL_TOP_K = 10
 
-# Stage 1: only pass candidates to the LLM if they're within this distance
-# (loose threshold — let the LLM do the real filtering)
-_RETRIEVAL_DISTANCE_CUTOFF = 0.75
+# Stage 1: two-tier distance thresholds (overridden by settings at runtime)
+# Primary   (≤ 0.65): high-confidence — always include
+# Secondary (≤ 0.85): borderline — include with flag so LLM can decide
+_RETRIEVAL_DISTANCE_PRIMARY   = 0.65
+_RETRIEVAL_DISTANCE_SECONDARY = 0.85
 
 # System prompt — sets the LLM role and output format
 _SYSTEM_PROMPT = """\
@@ -87,14 +89,25 @@ class RFCSemanticMatcher:
         embedder,                          # ChromaEmbedder instance
         llm_client=None,                   # OpenAI client (defaults to settings)
         retrieval_top_k: int = _RETRIEVAL_TOP_K,
-        retrieval_distance_cutoff: float = _RETRIEVAL_DISTANCE_CUTOFF,
+        retrieval_distance_primary: float | None = None,
+        retrieval_distance_secondary: float | None = None,
         llm_confidence_threshold: float = 0.70,  # minimum LLM confidence to draw an edge
     ):
         self.embedder = embedder
         self.llm = llm_client or settings.make_llm_client(tier="fast")
         self.model = settings.llm_fast_model
         self.retrieval_top_k = retrieval_top_k
-        self.retrieval_distance_cutoff = retrieval_distance_cutoff
+        # Use settings values as defaults (allow runtime override)
+        self.retrieval_distance_primary = (
+            retrieval_distance_primary
+            if retrieval_distance_primary is not None
+            else settings.rfc_distance_primary
+        )
+        self.retrieval_distance_secondary = (
+            retrieval_distance_secondary
+            if retrieval_distance_secondary is not None
+            else settings.rfc_distance_secondary
+        )
         self.llm_confidence_threshold = llm_confidence_threshold
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -112,8 +125,8 @@ class RFCSemanticMatcher:
         if not sections:
             return []
 
-        # (geid, rfc_number) → best edge so far
-        best: dict[tuple[str, int], SpecImplementsEdge] = {}
+        # (geid, section_spec_id) → best edge so far — section-granular de-dup
+        best: dict[tuple[str, str], SpecImplementsEdge] = {}
         verified_count = 0
         skipped_no_candidates = 0
 
@@ -153,9 +166,12 @@ class RFCSemanticMatcher:
                     citation_context=context,
                     match_type="llm",
                     similarity_score=round(conf, 4),
+                    section_spec_id=sec.spec_id,
+                    section_title=sec.section_title,
                 )
 
-                key = (geid, sec.rfc_number)
+                # De-dup at section level: one edge per (component, RFC section)
+                key = (geid, sec.spec_id or f"{sec.rfc_number}-{sec.section_number}")
                 existing = best.get(key)
                 if existing is None or conf > existing.similarity_score:
                     best[key] = edge
@@ -188,13 +204,21 @@ class RFCSemanticMatcher:
         candidates = []
         for hit in results:
             dist = hit.get("distance", 999.0)
-            if dist > self.retrieval_distance_cutoff:
-                continue
+            if dist > self.retrieval_distance_secondary:
+                continue  # outside even the loose threshold — discard
             geid = hit.get("geid", "")
             fqn  = hit.get("fqn", "")
             text = hit.get("text", "")
             if geid and fqn:
-                candidates.append({"geid": geid, "fqn": fqn, "description": text})
+                # Flag borderline candidates so the LLM prompt can signal lower confidence
+                is_borderline = dist > self.retrieval_distance_primary
+                candidates.append({
+                    "geid": geid,
+                    "fqn": fqn,
+                    "description": text,
+                    "distance": round(dist, 4),
+                    "borderline": is_borderline,
+                })
 
         return candidates
 
@@ -211,7 +235,9 @@ class RFCSemanticMatcher:
         rfc_body = sec.body_text[:2000]
 
         candidate_lines = "\n".join(
-            f'{i+1}. FQN: {c["fqn"]}\n   Description: {c["description"][:300]}'
+            f'{i+1}. FQN: {c["fqn"]}'
+            + (" [BORDERLINE MATCH — lower confidence]" if c.get("borderline") else "")
+            + f'\n   Description: {c["description"][:300]}'
             for i, c in enumerate(candidates)
         )
 

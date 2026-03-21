@@ -415,8 +415,12 @@ class QueryRouter:
         for _attempt in range(2):
             try:
                 col = self.chroma.get_collection(COMMUNITY_COLLECTION)
+                col_count = col.count()
+                if col_count == 0:
+                    logger.warning("Community collection is empty — run global_rollup.py first")
+                    return RouterResult("semantic", [], [], [], [], [], entity_names, [])
                 results = col.query(
-                    query_texts=[question], n_results=min(20, col.count()),
+                    query_texts=[question], n_results=min(20, col_count),
                 )
                 break  # success
             except (ConnectionError, TimeoutError, ConnectionAbortedError) as e:

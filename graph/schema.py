@@ -21,7 +21,9 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT db_table_name IF NOT EXISTS FOR (n:DatabaseTable) REQUIRE n.name IS UNIQUE",
     "CREATE CONSTRAINT config_key IF NOT EXISTS FOR (n:Configuration) REQUIRE n.config_key IS UNIQUE",
     # v2: RFC specification nodes
-    "CREATE CONSTRAINT spec_id IF NOT EXISTS FOR (s:Specification) REQUIRE s.spec_id IS UNIQUE",
+    "CREATE CONSTRAINT spec_rfc_number IF NOT EXISTS FOR (s:Specification) REQUIRE s.rfc_number IS UNIQUE",
+    # v3: section-granular specification nodes
+    "CREATE CONSTRAINT spec_section_id IF NOT EXISTS FOR (ss:SpecSection) REQUIRE ss.spec_id IS UNIQUE",
 ]
 
 INDEXES = [
@@ -44,7 +46,17 @@ INDEXES = [
     "CREATE INDEX component_visibility IF NOT EXISTS FOR (n:Component) ON (n.visibility)",
     "CREATE INDEX logicunit_lifecycle IF NOT EXISTS FOR (n:LogicUnit) ON (n.lifecycle_role)",
     # v2: specification index
-    "CREATE INDEX spec_rfc IF NOT EXISTS FOR (s:Specification) ON (s.rfc)",
+    "CREATE INDEX spec_rfc IF NOT EXISTS FOR (s:Specification) ON (s.rfc_number)",
+    # v3: section-level specification indexes
+    "CREATE INDEX spec_section_rfc IF NOT EXISTS FOR (ss:SpecSection) ON (ss.rfc_number)",
+    "CREATE INDEX spec_section_title IF NOT EXISTS FOR (ss:SpecSection) ON (ss.section_title)",
+    # v3: entry point scoring index
+    "CREATE INDEX logicunit_entry_score IF NOT EXISTS FOR (n:LogicUnit) ON (n.entry_point_score)",
+    "CREATE INDEX component_entry_score IF NOT EXISTS FOR (n:Component) ON (n.entry_point_score)",
+    # v3: blast radius indexes
+    "CREATE INDEX blast_radius_risk_comp IF NOT EXISTS FOR (n:Component) ON (n.blast_radius_risk)",
+    "CREATE INDEX blast_radius_risk_lu IF NOT EXISTS FOR (n:LogicUnit) ON (n.blast_radius_risk)",
+    "CREATE INDEX blast_radius_total IF NOT EXISTS FOR (n:Component) ON (n.blast_radius_total)",
 ]
 
 # Fulltext index — separate because syntax differs (not via CREATE INDEX)
@@ -52,6 +64,13 @@ FULLTEXT_INDEX = """
 CREATE FULLTEXT INDEX code_search IF NOT EXISTS
 FOR (n:LogicUnit|Component)
 ON EACH [n.fqn, n.docstring]
+"""
+
+# Extended fulltext index covering short name for BM25 hybrid search
+FULLTEXT_INDEX_NAMES = """
+CREATE FULLTEXT INDEX code_search_names IF NOT EXISTS
+FOR (n:LogicUnit|Component)
+ON EACH [n.name, n.fqn, n.docstring]
 """
 
 
@@ -68,8 +87,12 @@ def apply_schema(driver: Driver) -> None:
             session.run(FULLTEXT_INDEX).consume()
             logger.debug("Applied fulltext index: code_search")
         except Exception as e:
-            # Fulltext indexes require GDS or enterprise — graceful degradation
             logger.warning("Fulltext index not created (may need Neo4j 5.x): %s", e)
+        try:
+            session.run(FULLTEXT_INDEX_NAMES).consume()
+            logger.debug("Applied fulltext index: code_search_names")
+        except Exception as e:
+            logger.warning("Fulltext index code_search_names not created: %s", e)
 
     logger.info(
         "Schema setup complete — %d constraints, %d indexes",

@@ -9,6 +9,7 @@ These labels enable GDS Dijkstra shortest-path queries from any
 EntryPoint to any DataSink without brute-force multi-hop explosion.
 """
 from __future__ import annotations
+import json
 import logging
 from neo4j import Driver
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -86,14 +87,16 @@ class NodeTagger:
         stats = {
             "entry_points": 0,
             "data_sinks": 0,
+            "entry_point_scores": 0,
         }
 
         stats["entry_points"] = self._tag_entry_points()
         stats["data_sinks"] = self._tag_data_sinks()
+        stats["entry_point_scores"] = self._score_entry_points()
 
         logger.info(
-            "Tagging complete — %d EntryPoints, %d DataSinks",
-            stats["entry_points"], stats["data_sinks"],
+            "Tagging complete — %d EntryPoints, %d DataSinks, %d scored",
+            stats["entry_points"], stats["data_sinks"], stats["entry_point_scores"],
         )
         return stats
 
@@ -172,6 +175,131 @@ class NodeTagger:
 
         logger.info("Tagged %d EntryPoint nodes", count)
         return count
+
+    # ── Entry Point Scoring ───────────────────────────────────────────────────
+
+    # Annotations that give a high (3.0×) framework multiplier
+    _FRAMEWORK_HIGH = {
+        "Path", "GET", "POST", "PUT", "DELETE", "PATCH",
+        "RequestMapping", "GetMapping", "PostMapping", "PutMapping",
+        "DeleteMapping", "PatchMapping", "WebServlet",
+    }
+    # Annotations that give a medium (1.5×) framework multiplier
+    _FRAMEWORK_MED = {
+        "RestController", "Controller", "Service", "Component",
+        "FrameworkServlet",
+    }
+    # Name prefixes → multiplier
+    _NAME_BONUS_PREFIXES = ("handle", "on", "process", "execute", "dispatch")
+    _NAME_PENALTY_PREFIXES = ("get", "is", "set", "has", "to", "from")
+
+    @_tagger_retry
+    def _score_entry_points(self) -> int:
+        """
+        Compute multi-factor entry_point_score on all :EntryPoint nodes.
+
+        score = call_ratio × export_mult × naming_mult × framework_mult
+
+        Stores result as n.entry_point_score (float) on the node.
+        Returns the number of nodes scored.
+        """
+        with self.driver.session() as session:
+            rows = list(session.run(
+                """
+                MATCH (n:EntryPoint)
+                WHERE n.geid IS NOT NULL
+                OPTIONAL MATCH (n)-[:CALLS]->(out)
+                OPTIONAL MATCH (in_n)-[:CALLS]->(n)
+                OPTIONAL MATCH (n)-[:ANNOTATED_WITH]->(ann_type:AnnotationType)
+                RETURN n.geid        AS geid,
+                       n.name        AS name,
+                       n.visibility  AS visibility,
+                       n.annotations AS annotations,
+                       collect(DISTINCT ann_type.name) AS ann_names,
+                       count(DISTINCT out)  AS out_calls,
+                       count(DISTINCT in_n) AS in_calls
+                """
+            ))
+
+        if not rows:
+            return 0
+
+        scored = []
+        for row in rows:
+            out_c = row["out_calls"] or 0
+            in_c  = row["in_calls"]  or 0
+            call_ratio = out_c / (in_c + 1)
+
+            vis = (row["visibility"] or "").lower()
+            export_mult = {"public": 2.0, "protected": 1.5}.get(vis, 1.0)
+
+            naming_mult = self._naming_multiplier(row["name"] or "")
+            # Use ANNOTATED_WITH graph edges first; fall back to stored JSON property
+            ann_names = row.get("ann_names") or []
+            framework_mult = self._framework_multiplier_from_names(ann_names) or \
+                             self._framework_multiplier(row["annotations"])
+
+            # Framework-annotated endpoints (REST, OSGi activators) get a minimum
+            # base score of 1.0 so call_ratio=0 doesn't silence them entirely.
+            effective_ratio = max(call_ratio, 1.0) if framework_mult > 1.0 else call_ratio
+            score = effective_ratio * export_mult * naming_mult * framework_mult
+            scored.append({"geid": row["geid"], "score": round(score, 4)})
+
+        # Batch-write scores back
+        with self.driver.session() as session:
+            bs = settings.batch_size
+            for i in range(0, len(scored), bs):
+                batch = scored[i: i + bs]
+                session.run(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (n {geid: row.geid})
+                    SET n.entry_point_score = row.score
+                    """,
+                    rows=batch,
+                ).consume()
+
+        logger.info("Scored %d EntryPoint nodes with multi-factor formula", len(scored))
+        return len(scored)
+
+    @classmethod
+    def _naming_multiplier(cls, name: str) -> float:
+        lower = name.lower()
+        if any(lower.startswith(p) for p in cls._NAME_BONUS_PREFIXES):
+            return 1.5
+        if any(lower.startswith(p) for p in cls._NAME_PENALTY_PREFIXES):
+            return 0.3
+        return 1.0
+
+    @classmethod
+    def _framework_multiplier(cls, annotations_json: str | None) -> float:
+        if not annotations_json:
+            return 1.0
+        try:
+            anns = json.loads(annotations_json)
+        except (json.JSONDecodeError, TypeError):
+            return 1.0
+        names: set[str] = set()
+        for a in anns:
+            if isinstance(a, dict):
+                names.add(a.get("name", "").lstrip("@").split("(")[0])
+            elif isinstance(a, str):
+                names.add(a.lstrip("@").split("(")[0])
+        if names & cls._FRAMEWORK_HIGH:
+            return 3.0
+        if names & cls._FRAMEWORK_MED:
+            return 1.5
+        return 1.0
+
+    @classmethod
+    def _framework_multiplier_from_names(cls, ann_names: list[str]) -> float:
+        """Same logic as _framework_multiplier but from a flat list of annotation names."""
+        names = {n.lstrip("@").split("(")[0] for n in ann_names if n}
+        if names & cls._FRAMEWORK_HIGH:
+            return 3.0
+        if names & cls._FRAMEWORK_MED:
+            return 1.5
+        return 1.0
 
     # ── Data Sinks ────────────────────────────────────────────────────────────
 

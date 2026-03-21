@@ -336,8 +336,9 @@ class JavaParser:
                         var_name = self._get_identifier(c, source)
                         if var_name and type_name:
                             is_injected = any(
-                                ann.split("(")[0] in _INJECT_ANNOTATIONS
-                                for ann in annotations
+                                "@" + (a.get("name", "") if isinstance(a, dict) else a.lstrip("@").split("(")[0])
+                                in _INJECT_ANNOTATIONS
+                                for a in annotations
                             )
                             fields.append(FieldDeclaration(
                                 name=var_name,
@@ -499,7 +500,7 @@ class JavaParser:
                         attr_value = pair_m.group(2) or pair_m.group(3) or pair_m.group(4) or ""
                         attrs[attr_name] = attr_value
                     if attrs:
-                        result.update(attrs)
+                        result["attrs"] = attrs  # don't overwrite result["name"] (annotation class)
                     elif raw_args:
                         result["value"] = raw_args[:200]
         return result
@@ -511,6 +512,13 @@ class JavaParser:
                 ann = self._parse_annotation(child, source)
                 if ann:
                     annotations.append(ann)
+            elif child.type == "modifiers":
+                # Annotations on class/method declarations are wrapped in a modifiers node
+                for mod_child in child.children:
+                    if mod_child.type in ("marker_annotation", "annotation"):
+                        ann = self._parse_annotation(mod_child, source)
+                        if ann:
+                            annotations.append(ann)
         return annotations
 
     def _extract_preceding_javadoc(self, node: Node, source: bytes) -> str:

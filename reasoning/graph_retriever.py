@@ -118,6 +118,158 @@ class GraphRetriever:
             "edge_counts": edge_counts,
         }
 
+    # ── Hybrid Search (BM25 + Semantic + RRF) ────────────────────────────────
+
+    def hybrid_search(
+        self,
+        query: str,
+        embedder=None,
+        n_results: int | None = None,
+        rrf_k: int | None = None,
+    ) -> list[dict]:
+        """
+        Reciprocal Rank Fusion over Neo4j BM25 fulltext + ChromaDB semantic search.
+
+        Algorithm (from GitNexus):
+          1. BM25 fulltext search via Neo4j ``code_search_names`` index.
+          2. Semantic vector search via ChromaDB ``code_intent`` collection.
+          3. RRF score = 1/(K + rank) for each source, K=60 (literature default).
+          4. Sum RRF scores for GEIDs appearing in both result sets.
+          5. Return merged list sorted by descending RRF score.
+
+        Args:
+            query:     Natural language or identifier query string.
+            embedder:  ChromaEmbedder instance (falls back to self._chroma if None).
+            n_results: Number of candidates per source (defaults to settings value).
+            rrf_k:     RRF constant K (defaults to settings.rrf_k).
+
+        Returns:
+            List of dicts with keys: geid, fqn, rrf_score, sources, text, distance
+        """
+        n   = n_results or settings.hybrid_search_n_results
+        k   = rrf_k     or settings.rrf_k
+
+        bm25_results     = self._bm25_search(query, n)
+        semantic_results = self._semantic_search(query, embedder, n)
+
+        # Build RRF score maps keyed by geid
+        rrf_bm25: dict[str, float] = {
+            r["geid"]: 1.0 / (k + rank + 1)
+            for rank, r in enumerate(bm25_results)
+            if r.get("geid")
+        }
+        # Semantic results are sorted ascending by distance (lower = more similar)
+        rrf_semantic: dict[str, float] = {
+            r["geid"]: 1.0 / (k + rank + 1)
+            for rank, r in enumerate(
+                sorted(semantic_results, key=lambda x: x.get("distance", 999.0))
+            )
+            if r.get("geid")
+        }
+
+        # Collect metadata per geid
+        meta: dict[str, dict] = {}
+        for r in bm25_results:
+            geid = r.get("geid")
+            if geid:
+                meta[geid] = {"geid": geid, "fqn": r.get("fqn", ""),
+                               "text": r.get("text", ""), "distance": None}
+        for r in semantic_results:
+            geid = r.get("geid")
+            if geid and geid not in meta:
+                meta[geid] = {"geid": geid, "fqn": r.get("fqn", ""),
+                               "text": r.get("text", ""), "distance": r.get("distance")}
+            elif geid:
+                meta[geid]["distance"] = r.get("distance")
+                if not meta[geid].get("text"):
+                    meta[geid]["text"] = r.get("text", "")
+
+        # Merge and rank
+        all_geids = set(rrf_bm25) | set(rrf_semantic)
+        results = []
+        for geid in all_geids:
+            score  = rrf_bm25.get(geid, 0.0) + rrf_semantic.get(geid, 0.0)
+            sources = []
+            if geid in rrf_bm25:
+                sources.append("bm25")
+            if geid in rrf_semantic:
+                sources.append("semantic")
+            row = {**meta.get(geid, {"geid": geid, "fqn": ""}),
+                   "rrf_score": round(score, 6),
+                   "sources":   sources}
+            results.append(row)
+
+        results.sort(key=lambda x: x["rrf_score"], reverse=True)
+        results = results[:n]
+
+        logger.info(
+            "hybrid_search('%s'): bm25=%d semantic=%d merged=%d",
+            query[:60], len(bm25_results), len(semantic_results), len(results),
+        )
+        return results
+
+    @_neo4j_retry
+    def _bm25_search(self, query: str, n_results: int) -> list[dict]:
+        """
+        BM25 fulltext search using Neo4j ``code_search_names`` index.
+        Falls back to ``code_search`` if the names index isn't populated yet.
+        Returns list of {geid, fqn, text, bm25_score} sorted by score desc.
+        """
+        # Escape special Lucene characters that Neo4j fulltext uses
+        escaped = query.replace('"', '\\"').replace("'", "\\'")
+        with self._driver.session() as session:
+            for index_name in ("code_search_names", "code_search"):
+                try:
+                    rows = list(session.run(
+                        f"""
+                        CALL db.index.fulltext.queryNodes('{index_name}', $query)
+                        YIELD node, score
+                        WHERE score > 0
+                        RETURN node.geid     AS geid,
+                               node.fqn      AS fqn,
+                               node.docstring AS text,
+                               score
+                        ORDER BY score DESC
+                        LIMIT $n
+                        """,
+                        query=escaped,
+                        n=n_results,
+                    ))
+                    if rows is not None:
+                        return [dict(r) for r in rows]
+                except Exception as e:
+                    logger.debug("BM25 index '%s' query failed: %s", index_name, e)
+        logger.debug("BM25 fulltext search returned no results for: %s", query)
+        return []
+
+    def _semantic_search(self, query: str, embedder, n_results: int) -> list[dict]:
+        """
+        Semantic vector search via ChromaDB code_intent collection.
+        Returns list of {geid, fqn, text, distance} sorted ascending by distance.
+        """
+        chroma_embedder = embedder or self._chroma
+        if not chroma_embedder:
+            return []
+        try:
+            # Accept either a ChromaEmbedder instance or a raw chromadb client
+            if hasattr(chroma_embedder, "semantic_search"):
+                return chroma_embedder.semantic_search(
+                    query=query,
+                    collection="code_intent",
+                    n_results=n_results,
+                )
+            # Raw chroma client fallback
+            from vectorstore.embedder import ChromaEmbedder
+            embedder_obj = ChromaEmbedder(chroma_embedder)
+            return embedder_obj.semantic_search(
+                query=query,
+                collection="code_intent",
+                n_results=n_results,
+            )
+        except Exception as e:
+            logger.warning("Semantic search failed in hybrid_search: %s", e)
+            return []
+
     def find_nodes(self, entity_name: str) -> list[dict]:
         """
         Two-strategy entity lookup:
@@ -234,7 +386,7 @@ class GraphRetriever:
 
                 // Traverse inbound edges — who calls/uses/injects the seed?
                 CALL apoc.path.expandConfig(seed, {
-                    relationshipFilter: '<CALLS|<INJECTS|<DEPENDS_ON|<INSTANTIATES',
+                    relationshipFilter: '<CALLS|<INJECTS|<DEPENDS_ON|<INSTANTIATES|<OVERRIDES',
                     minLevel: 1,
                     maxLevel: $depth,
                     uniqueness: 'NODE_GLOBAL'
@@ -386,12 +538,11 @@ class GraphRetriever:
         with self._driver.session() as session:
             result = session.run(
                 """
-                MATCH path = (caller)-[:CALLS*1..$depth]->(target)
+                MATCH (caller)-[:CALLS]->(target)
                 WHERE (target:LogicUnit OR target:Component)
                   AND target.fqn = $fqn
                   AND (caller:LogicUnit OR caller:Component)
                   AND (caller.file_path CONTAINS 'src/main/java' OR caller.file_path CONTAINS 'src\\main\\java')
-                WITH caller, length(path) AS hop
                 RETURN DISTINCT
                     caller.fqn          AS fqn,
                     caller.file_path    AS file_path,
@@ -399,11 +550,11 @@ class GraphRetriever:
                     caller.end_line     AS end_line,
                     caller.community_id AS community_id,
                     'CALLS'             AS edge_type,
-                    hop
-                ORDER BY hop, caller.fqn
+                    1                   AS hop
+                ORDER BY caller.fqn
                 LIMIT 30
                 """,
-                fqn=fqn, depth=depth,
+                fqn=fqn,
             )
             rows = [dict(r) for r in result]
         logger.info("get_callers('%s', depth=%d) → %d nodes", fqn, depth, len(rows))
@@ -418,12 +569,11 @@ class GraphRetriever:
         with self._driver.session() as session:
             result = session.run(
                 """
-                MATCH path = (target)-[:CALLS*1..$depth]->(callee)
+                MATCH (target)-[:CALLS]->(callee)
                 WHERE (target:LogicUnit OR target:Component)
                   AND target.fqn = $fqn
                   AND (callee:LogicUnit OR callee:Component)
                   AND (callee.file_path CONTAINS 'src/main/java' OR callee.file_path CONTAINS 'src\\main\\java')
-                WITH callee, length(path) AS hop
                 RETURN DISTINCT
                     callee.fqn          AS fqn,
                     callee.file_path    AS file_path,
@@ -431,11 +581,11 @@ class GraphRetriever:
                     callee.end_line     AS end_line,
                     callee.community_id AS community_id,
                     'CALLED_BY'         AS edge_type,
-                    hop
-                ORDER BY hop, callee.fqn
+                    1                   AS hop
+                ORDER BY callee.fqn
                 LIMIT 30
                 """,
-                fqn=fqn, depth=depth,
+                fqn=fqn,
             )
             rows = [dict(r) for r in result]
         logger.info("get_callees('%s', depth=%d) → %d nodes", fqn, depth, len(rows))
@@ -673,7 +823,7 @@ class GraphRetriever:
                 MATCH (seed)
                 WHERE (seed:LogicUnit OR seed:Component)
                   AND seed.fqn IN $fqns
-                MATCH (affected)-[r:CALLS|INJECTS|DEPENDS_ON|INSTANTIATES]->(seed)
+                MATCH (affected)-[r:CALLS|INJECTS|DEPENDS_ON|INSTANTIATES|OVERRIDES]->(seed)
                 WHERE (affected:LogicUnit OR affected:Component)
                   AND (affected.file_path CONTAINS 'src/main/java' OR affected.file_path CONTAINS 'src\\main\\java')
                   AND affected.community_id IS NOT NULL

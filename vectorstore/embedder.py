@@ -97,7 +97,10 @@ class ChromaEmbedder:
             List of dicts with keys: geid, fqn, chunk_type, distance, text
         """
         col = self._logic_col if collection == "code_logic" else self._intent_col
-        kwargs = {"query_texts": [query], "n_results": n_results}
+        safe_n = min(n_results, col.count())
+        if safe_n <= 0:
+            return []
+        kwargs = {"query_texts": [query], "n_results": safe_n}
         if where:
             kwargs["where"] = where
 
