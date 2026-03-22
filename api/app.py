@@ -179,9 +179,10 @@ async def query(req: QueryRequest, _=Depends(verify_api_key)):
     primary_targets = []
     for hit in result.grep_hits:
         if hasattr(hit, "rel_path"):
+            class_name = hit.rel_path.replace("\\", "/").split("/")[-1].replace(".java", "")
             primary_targets.append({
                 "source": "grep",
-                "fqn": hit.rel_path,
+                "fqn": class_name,
                 "file_path": hit.rel_path,
                 "line_number": hit.line_number,
                 "text": hit.line_text,
@@ -192,11 +193,43 @@ async def query(req: QueryRequest, _=Depends(verify_api_key)):
     for node in result.affected_nodes[:10]:
         primary_targets.append({**node, "source": "graph"})
 
+    # Fetch actual source code — one snippet per file (best hit), then node method bodies.
+    code_snippets = []
+    try:
+        from reasoning.code_fetcher import CodeFetcher
+        fetcher = CodeFetcher()
+        # Pass 1: best grep hit per file — avoids same file eating all snippet slots
+        file_best: dict[str, dict] = {}
+        for t in primary_targets:
+            if t.get("source") != "grep":
+                continue
+            fp = t.get("file_path", "")
+            if not fp or not t.get("line_number"):
+                continue
+            txt = t.get("text", "")
+            is_test   = "src/test" in fp or "Test.java" in fp
+            is_import = txt.strip().startswith("import ")
+            is_defn   = "static final" in txt and "=" in txt
+            score = 0 if (is_import or is_defn) else (1 if is_test else 2)
+            if fp not in file_best or score > file_best[fp]["score"]:
+                file_best[fp] = {**t, "score": score}
+        for fp, t in list(file_best.items())[:10]:
+            snippet = fetcher.fetch_grep_context(fp, t["line_number"], context_lines=10)
+            if snippet:
+                code_snippets.append(snippet)
+        # Pass 2: graph/semantic nodes with full method bodies
+        fetchable = [t for t in primary_targets if t.get("file_path") and t.get("start_line")]
+        node_snippets = fetcher.fetch_for_nodes(fetchable[:6])
+        code_snippets.extend(node_snippets)
+    except Exception as e:
+        logger.debug("Code fetch failed for query: %s", e)
+
     try:
         answer = reduce.run(
             map_results=map_results,
             query=req.question,
             primary_targets=primary_targets,
+            code_snippets=code_snippets,
             route=result.route,
         )
     except Exception as e:
@@ -377,6 +410,14 @@ async def stats(_=Depends(verify_api_key)):
         out.chroma_code_intent = col.count()
     except Exception:
         pass
+
+    try:
+        col = chroma.get_collection("code_logic")
+        out.chroma_code_logic = col.count()
+    except Exception:
+        pass
+
+    out.chroma_total_vectors = out.chroma_code_intent + out.chroma_code_logic
 
     return out
 

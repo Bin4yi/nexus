@@ -142,10 +142,18 @@ def _serialize_lu(lu) -> dict:
 
 
 def _serialize_field(f) -> dict:
+    # FieldDeclaration.annotations is list[str], but the Java parser can return
+    # annotation dicts like {"name": "JsonIgnore", "attrs": {...}}.
+    # Normalise to strings by extracting the "name" key from dicts.
+    raw_annots = f.annotations or []
+    annotations = [
+        a["name"] if isinstance(a, dict) else str(a)
+        for a in raw_annots
+    ]
     return {
         "name": f.name,
         "type_name": f.type_name,
-        "annotations": f.annotations,
+        "annotations": annotations,
         "is_injected": f.is_injected,
     }
 

@@ -136,3 +136,4 @@ requirements-lock.txt
 
 # ── MyPy / Pyright caches ─────────────────────────────────────────────────────
 .mypy_cache/
+.nexus_watch_hashes.json

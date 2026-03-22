@@ -94,6 +94,8 @@ class GraphStats(BaseModel):
     data_sinks: int = 0
     communities: int = 0
     chroma_code_intent: int = 0
+    chroma_code_logic: int = 0
+    chroma_total_vectors: int = 0
 
 
 # ── Health response ───────────────────────────────────────────────────────────

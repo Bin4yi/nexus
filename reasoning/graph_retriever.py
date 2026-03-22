@@ -308,10 +308,11 @@ class GraphRetriever:
                     OR n.fqn    ENDS WITH ('.' + $name)
                     OR (n.docstring IS NOT NULL AND n.docstring CONTAINS $name)
                   )
-                  AND (n.file_path CONTAINS 'src/main/java' OR n.file_path CONTAINS 'src\\main\\java')
                 RETURN
                     n.fqn          AS fqn,
                     n.file_path    AS file_path,
+                    n.start_line   AS start_line,
+                    n.end_line     AS end_line,
                     labels(n)[0]   AS label,
                     n.community_id AS community_id
                 LIMIT 20
@@ -393,11 +394,12 @@ class GraphRetriever:
                 }) YIELD path
                 WITH nodes(path)[-1] AS affected, relationships(path)[0] AS rel
                 WHERE (affected:LogicUnit OR affected:Component)
-                  AND (affected.file_path CONTAINS 'src/main/java' OR affected.file_path CONTAINS 'src\\main\\java')
                   AND affected.community_id IS NOT NULL
                 RETURN DISTINCT
                     affected.fqn          AS fqn,
                     affected.file_path    AS file_path,
+                    affected.start_line   AS start_line,
+                    affected.end_line     AS end_line,
                     affected.community_id AS community_id,
                     type(rel)             AS edge_type
                 ORDER BY affected.community_id, affected.fqn
@@ -532,17 +534,18 @@ class GraphRetriever:
     @_neo4j_retry
     def get_callers(self, fqn: str, depth: int = 1) -> list[dict]:
         """
-        Who calls this method? Returns inbound CALLS edges up to `depth` hops.
+        Who calls this method/class? Returns inbound CALLS edges up to `depth` hops.
+        For Component FQNs, also finds callers of any of its methods.
         Each row: {fqn, file_path, start_line, end_line, community_id, edge_type, hop}
         """
         with self._driver.session() as session:
+            # Direct callers of this exact FQN
             result = session.run(
                 """
                 MATCH (caller)-[:CALLS]->(target)
                 WHERE (target:LogicUnit OR target:Component)
                   AND target.fqn = $fqn
                   AND (caller:LogicUnit OR caller:Component)
-                  AND (caller.file_path CONTAINS 'src/main/java' OR caller.file_path CONTAINS 'src\\main\\java')
                 RETURN DISTINCT
                     caller.fqn          AS fqn,
                     caller.file_path    AS file_path,
@@ -557,23 +560,47 @@ class GraphRetriever:
                 fqn=fqn,
             )
             rows = [dict(r) for r in result]
+
+            # If this is a Component (class), also find callers of its methods
+            if not rows:
+                result2 = session.run(
+                    """
+                    MATCH (comp:Component {fqn: $fqn})-[:HAS_METHOD]->(lu:LogicUnit)
+                    MATCH (caller)-[:CALLS]->(lu)
+                    WHERE caller:LogicUnit OR caller:Component
+                    RETURN DISTINCT
+                        caller.fqn          AS fqn,
+                        caller.file_path    AS file_path,
+                        caller.start_line   AS start_line,
+                        caller.end_line     AS end_line,
+                        caller.community_id AS community_id,
+                        'CALLS'             AS edge_type,
+                        1                   AS hop
+                    ORDER BY caller.fqn
+                    LIMIT 30
+                    """,
+                    fqn=fqn,
+                )
+                rows = [dict(r) for r in result2]
+
         logger.info("get_callers('%s', depth=%d) → %d nodes", fqn, depth, len(rows))
         return rows
 
     @_neo4j_retry
     def get_callees(self, fqn: str, depth: int = 1) -> list[dict]:
         """
-        What does this method call? Returns outbound CALLS edges up to `depth` hops.
+        What does this method/class call? Returns outbound CALLS edges up to `depth` hops.
+        For Component FQNs, returns callees of all its methods.
         Each row: {fqn, file_path, start_line, end_line, community_id, hop}
         """
         with self._driver.session() as session:
+            # Direct callees from this exact FQN
             result = session.run(
                 """
                 MATCH (target)-[:CALLS]->(callee)
                 WHERE (target:LogicUnit OR target:Component)
                   AND target.fqn = $fqn
                   AND (callee:LogicUnit OR callee:Component)
-                  AND (callee.file_path CONTAINS 'src/main/java' OR callee.file_path CONTAINS 'src\\main\\java')
                 RETURN DISTINCT
                     callee.fqn          AS fqn,
                     callee.file_path    AS file_path,
@@ -588,6 +615,29 @@ class GraphRetriever:
                 fqn=fqn,
             )
             rows = [dict(r) for r in result]
+
+            # If this is a Component (class), aggregate callees across all its methods
+            if not rows:
+                result2 = session.run(
+                    """
+                    MATCH (comp:Component {fqn: $fqn})-[:HAS_METHOD]->(lu:LogicUnit)
+                    MATCH (lu)-[:CALLS]->(callee)
+                    WHERE callee:LogicUnit OR callee:Component
+                    RETURN DISTINCT
+                        callee.fqn          AS fqn,
+                        callee.file_path    AS file_path,
+                        callee.start_line   AS start_line,
+                        callee.end_line     AS end_line,
+                        callee.community_id AS community_id,
+                        'CALLED_BY'         AS edge_type,
+                        1                   AS hop
+                    ORDER BY callee.fqn
+                    LIMIT 30
+                    """,
+                    fqn=fqn,
+                )
+                rows = [dict(r) for r in result2]
+
         logger.info("get_callees('%s', depth=%d) → %d nodes", fqn, depth, len(rows))
         return rows
 

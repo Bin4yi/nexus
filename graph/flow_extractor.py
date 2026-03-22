@@ -196,16 +196,13 @@ class FlowExtractor:
             logger.warning("No flow node labels found in DB")
             return
 
-        # Sprint 3: Build relationship projection with per-type default weights.
-        # Weight property "weight" is used if present on the relationship,
-        # otherwise the defaultValue from _EDGE_WEIGHTS is applied.
-        # This gives REMOTE_CALLS (cross-service) a penalty of 5 vs CALLS=1.
+        # Project relationships without weight properties — relationships in Neo4j
+        # don't store a 'weight' property, so we use unweighted projection and
+        # BFS-equivalent shortest path (all edges cost 1).
         rel_entries = []
         for rel in projected_rels:
-            default_weight = _EDGE_WEIGHTS.get(rel, 1.0)
             rel_entries.append(
-                f"{rel}: {{orientation: 'UNDIRECTED', "
-                f"properties: {{weight: {{property: 'weight', defaultValue: {default_weight}}}}}}}"
+                f"{rel}: {{orientation: 'UNDIRECTED'}}"
             )
         rel_map = ", ".join(rel_entries)
         label_list = str(projected_labels)
@@ -302,8 +299,7 @@ class FlowExtractor:
                     MATCH (end) WHERE id(end) = $end_id
                     CALL gds.shortestPath.dijkstra.stream($graph_name, {
                         sourceNode: start,
-                        targetNode: end,
-                        relationshipWeightProperty: 'weight'
+                        targetNode: end
                     })
                     YIELD index, sourceNode, targetNode, totalCost, nodeIds, costs, path
                     RETURN nodeIds, totalCost

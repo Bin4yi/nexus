@@ -1,12 +1,12 @@
 repositories:
-  # - name: identity-server
-  #   url: https://github.com/wso2/product-is.git
-  #   branch: master
+  - name: identity-server
+    url: https://github.com/wso2/product-is.git
+    branch: master
 
-  # - name: carbon-identity-framework
-  #   url: https://github.com/Thumimku/carbon-identity-framework.git
-  #   branch: poc-authorizedAPIcheck
-  #   language: java
+  - name: carbon-identity-framework
+    url: https://github.com/Thumimku/carbon-identity-framework.git
+    branch: poc-authorizedAPIcheck
+    language: java
 
   - name: identity-oauth2-grant-token-exchange
     url: https://github.com/wso2-extensions/identity-oauth2-grant-token-exchange.git

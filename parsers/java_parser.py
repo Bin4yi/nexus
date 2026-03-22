@@ -340,10 +340,14 @@ class JavaParser:
                                 in _INJECT_ANNOTATIONS
                                 for a in annotations
                             )
+                            norm_annotations = [
+                                a["name"] if isinstance(a, dict) else str(a)
+                                for a in annotations
+                            ]
                             fields.append(FieldDeclaration(
                                 name=var_name,
                                 type_name=type_name,
-                                annotations=annotations,
+                                annotations=norm_annotations,
                                 is_injected=is_injected,
                             ))
         return fields

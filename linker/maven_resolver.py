@@ -40,8 +40,14 @@ class MavenResolver:
                 - module_info dict: {group_id, artifact_id, version}
                 - list of DependencyEdge objects
         """
-        tree = etree.parse(str(pom_path))
-        root = tree.getroot()
+        try:
+            pom_bytes = Path(pom_path).read_bytes()
+            if not pom_bytes.strip():
+                return {}, []
+            tree = etree.fromstring(pom_bytes)
+            root = tree
+        except etree.XMLSyntaxError:
+            return {}, []
 
         module_info = {
             "group_id": self._text(root, "m:groupId") or self._text(root, "m:parent/m:groupId") or "",

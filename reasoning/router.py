@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from config.settings import settings
@@ -112,11 +113,33 @@ class QueryClassifier:
         # ── Symbolic signals ──────────────────────────────────────────────
         upper_snake = re.findall(r'\b[A-Z][A-Z0-9_]{2,}\b', question)
         quoted = re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]{2,})["\']', question)
-        symbols = list(dict.fromkeys(upper_snake + quoted))
+
+        # For safety queries ("can I remove X"), also detect lower_snake_case tokens
+        # and promote them to symbolic route by trying the uppercase variant for grep.
+        _SAFETY_QUERY_RE = re.compile(
+            r'\b(can i|is it safe|safe to|should i|ok to|remove|delete|drop|unused)\b',
+            re.IGNORECASE,
+        )
+        extra_snake = []
+        if _SAFETY_QUERY_RE.search(question):
+            lower_snake = re.findall(r'\b[a-z][a-z0-9_]{2,}\b', question)
+            extra_snake = [t.upper() for t in lower_snake if '_' in t]
+
+        # Promote UPPER_SNAKE_CASE candidates generated from compound phrases
+        # (e.g. "may act" → "MAY_ACT") to the symbolic/grep route so claim names
+        # are found via lexical search rather than fuzzy graph node lookup.
+        compound_snake = [
+            name for name in entity_names
+            if re.match(r'^[A-Z][A-Z0-9_]{2,}$', name) and '_' in name
+        ]
+
+        symbols = list(dict.fromkeys(upper_snake + quoted + extra_snake + compound_snake))
 
         if symbols:
             confidence = min(1.0, 0.6 + 0.1 * len(symbols))
-            return QueryClassification("symbolic", confidence, symbols, entity_names)
+            # Strip compound_snake from entity_names to avoid double-routing
+            clean_entity_names = [n for n in entity_names if n not in compound_snake]
+            return QueryClassification("symbolic", confidence, symbols, clean_entity_names)
 
         # ── Exact-entity signals ──────────────────────────────────────────
         if entity_names:
@@ -137,6 +160,8 @@ class QueryClassifier:
     def _extract_entity_names(question: str) -> list[str]:
         """
         Extract CamelCase / lowerCamelCase / dotted FQN candidates.
+        Also converts compound noun phrases ("token exchange") to CamelCase
+        ("TokenExchange") so feature-name queries hit the exact route.
 
         Returns a list sorted by length (longest first) so that the most
         specific match anchors graph lookups.
@@ -152,6 +177,38 @@ class QueryClassifier:
         candidates.update(re.findall(
             r'\b[a-z][a-z0-9]+\.[a-z][a-z0-9]+(?:\.[a-z][a-z0-9]+)*\b', question,
         ))
+        # Compound noun phrases: "token exchange" → "TokenExchange"
+        # Converts consecutive lowercase words (2–4 words) into CamelCase candidates
+        # so "token exchange grant handler" finds TokenExchangeGrantHandler.
+        # 2-word phrases ALSO generate UPPER_SNAKE_CASE (e.g. "may act" → "MAY_ACT")
+        # so claim/constant names get picked up by grep rather than fuzzy graph lookup.
+        _STOP = frozenset([
+            "the", "a", "an", "in", "of", "to", "for", "and", "or", "is",
+            "are", "what", "how", "can", "this", "that", "with", "from",
+            "should", "would", "will", "does", "do", "if", "when", "where",
+            "files", "file", "code", "class", "method", "safely", "change",
+            "changes", "introduce", "implement", "add", "use", "using",
+            "flow", "mandatory", "claim", "request", "response", "grant",
+            "impersonation", "token", "oauth", "enable", "support", "check",
+            # Generic verbs that produce junk constants (e.g. VALIDATION_HAPPNES)
+            "validation", "happens", "happen", "happening", "handles", "handle",
+            "performs", "perform", "process", "processes", "execute", "executes",
+            "works", "runs", "checks", "triggers", "calls", "returns", "throws",
+            "creates", "builds", "gets", "sets", "sends", "receives", "invokes",
+        ])
+        words = re.findall(r'\b[a-z][a-z0-9]+\b', question.lower())
+        content_words = [w for w in words if w not in _STOP]
+        for n in (4, 3, 2):
+            for i in range(len(content_words) - n + 1):
+                phrase = content_words[i:i + n]
+                camel = "".join(w.capitalize() for w in phrase)
+                if len(camel) > 5:
+                    candidates.add(camel)
+                # 2-word phrases → UPPER_SNAKE_CASE for constant/claim name detection
+                # e.g. "may act" → "MAY_ACT", "subject token" → "SUBJECT_TOKEN"
+                if n == 2:
+                    snake = "_".join(w.upper() for w in phrase)
+                    candidates.add(snake)
         return sorted(candidates, key=len, reverse=True)
 
 
@@ -205,7 +262,7 @@ class QueryRouter:
                 raise
 
     def route(self, question: str) -> RouterResult:
-        """Classify → retrieve → return structured ``RouterResult``."""
+        """Classify → retrieve ALL evidence paths in parallel → merge → return."""
         classification = self.classifier.classify(question)
         logger.info(
             "Query classified  bucket=%s  confidence=%.2f  symbols=%s  entities=%s",
@@ -215,35 +272,113 @@ class QueryRouter:
             classification.entity_names[:3],
         )
 
-        # ROUTE D — Global architecture: return L3 summary directly
+        # ROUTE D — Global architecture: return L3 summary directly (no merge needed)
         if classification.bucket == "global":
             return self._global_route(question)
 
-        if classification.bucket == "symbolic":
-            return self._symbolic_route(
-                question, classification.symbols, classification.entity_names,
-            )
-        if classification.bucket == "exact":
-            # Always use deterministic route for clear CamelCase/FQN patterns
-            is_camel_case = any(
-                re.match(r'^[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+$', name)
-                for name in classification.entity_names
-            )
-            if not is_camel_case and classification.confidence < settings.router_confidence_threshold:
-                logger.info(
-                    "Exact confidence %.2f < threshold %.2f — falling back to semantic",
-                    classification.confidence,
-                    settings.router_confidence_threshold,
-                )
-                return self._semantic_route(question, classification.entity_names)
-            return self._exact_entity_route(question, classification.entity_names)
-
-        return self._semantic_route(question, classification.entity_names)
+        # All other routes: run every applicable evidence path in parallel, then merge.
+        return self._multi_route(question, classification)
 
     def close(self):
         self.retriever.close()
 
     # ── Private: Route implementations ────────────────────────────────────────
+
+    def _multi_route(self, question: str, classification: QueryClassification) -> RouterResult:
+        """
+        Run ALL applicable evidence paths in parallel and merge the results.
+
+        Paths run:
+          A) Grep/symbolic  — if symbols or entity_names yield any UPPER_SNAKE tokens
+          B) Graph/exact    — if entity_names contains CamelCase or dotted FQN candidates
+          C) Semantic       — always (hybrid BM25 + vector + community summaries)
+
+        Merging: nodes deduped by FQN, community summaries deduped by community_id.
+        The primary route label (for logging) is determined by what found the most evidence.
+        """
+        symbols     = classification.symbols
+        entity_names = classification.entity_names
+
+        tasks: dict[str, callable] = {}
+
+        if symbols:
+            tasks["grep"] = lambda: self._symbolic_route(question, symbols, entity_names)
+        if entity_names:
+            tasks["graph"] = lambda: self._exact_entity_route(question, entity_names)
+        tasks["semantic"] = lambda: self._semantic_route(question, entity_names)
+
+        results: dict[str, RouterResult] = {}
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            futures = {pool.submit(fn): name for name, fn in tasks.items()}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    results[name] = future.result()
+                except Exception as e:
+                    logger.warning("Route '%s' failed: %s", name, e)
+
+        if not results:
+            # All paths failed — return empty result
+            return RouterResult(
+                route="failed", grep_hits=[], seed_nodes=[], affected_nodes=[],
+                community_ids=[], community_summaries=[], entity_names=entity_names,
+                symbols=symbols,
+            )
+
+        # ── Merge: deduplicate by FQN for nodes, by community_id for summaries ──
+        all_grep_hits: list[GrepHit] = []
+        seen_fqns: set[str] = set()
+        seed_nodes: list[dict] = []
+        affected_nodes: list[dict] = []
+        seen_community_ids: set[int] = set()
+        community_summaries: list[dict] = []
+
+        # Priority order: grep seeds first (most precise), then graph, then semantic
+        for source in ("grep", "graph", "semantic"):
+            r = results.get(source)
+            if not r:
+                continue
+            all_grep_hits.extend(r.grep_hits)
+            for n in r.seed_nodes:
+                fqn = n.get("fqn", "")
+                if fqn and fqn not in seen_fqns:
+                    seed_nodes.append(n)
+                    seen_fqns.add(fqn)
+            for n in r.affected_nodes:
+                fqn = n.get("fqn", "")
+                if fqn and fqn not in seen_fqns:
+                    affected_nodes.append(n)
+                    seen_fqns.add(fqn)
+            for s in r.community_summaries:
+                cid = s.get("community_id")
+                if cid not in seen_community_ids:
+                    community_summaries.append(s)
+                    seen_community_ids.add(cid)
+
+        # Route label: name the dominant path for display
+        if "grep" in results and results["grep"].grep_hits:
+            route_label = "hybrid_grep+graph+semantic"
+        elif "graph" in results and results["graph"].seed_nodes:
+            route_label = "hybrid_graph+semantic"
+        else:
+            route_label = "semantic"
+
+        community_ids = sorted(seen_community_ids)
+        logger.info(
+            "Multi-route merge: grep=%d hits, seed_nodes=%d, affected=%d, communities=%d  [%s]",
+            len(all_grep_hits), len(seed_nodes), len(affected_nodes),
+            len(community_summaries), route_label,
+        )
+        return RouterResult(
+            route=route_label,
+            grep_hits=all_grep_hits,
+            seed_nodes=seed_nodes,
+            affected_nodes=affected_nodes,
+            community_ids=community_ids,
+            community_summaries=community_summaries,
+            entity_names=entity_names,
+            symbols=symbols,
+        )
 
     def _global_route(self, question: str) -> RouterResult:
         """
@@ -409,47 +544,77 @@ class QueryRouter:
         self, question: str, entity_names: list[str],
     ) -> RouterResult:
         """
-        ROUTE C: ChromaDB vector search on ``community_summaries``.
+        ROUTE C: Hybrid search (BM25 + code_intent vectors) → seed_nodes + community summaries.
+
+        Two-pass retrieval:
+          1. hybrid_search() → top code nodes (BM25 + ChromaDB code_intent RRF)
+          2. community_summaries vector search → relevant community context
         """
         logger.info("Route: SEMANTIC")
+
+        # ── Pass 1: hybrid code search → seed_nodes ───────────────────────────
+        seed_nodes: list[dict] = []
+        community_ids: set[int] = set()
+        try:
+            hybrid_hits = self.retriever.hybrid_search(question, n_results=15)
+            seen_fqns: set[str] = set()
+            for hit in hybrid_hits:
+                fqn = hit.get("fqn", "")
+                if fqn and fqn not in seen_fqns:
+                    # Enrich with full node data from Neo4j
+                    nodes = self.retriever.find_nodes(fqn)
+                    for node in nodes:
+                        nfqn = node.get("fqn", "")
+                        if nfqn and nfqn not in seen_fqns:
+                            seed_nodes.append(node)
+                            seen_fqns.add(nfqn)
+                            cid = node.get("community_id")
+                            if cid is not None:
+                                community_ids.add(cid)
+            logger.info("Semantic hybrid search: %d seed nodes found", len(seed_nodes))
+        except Exception as e:
+            logger.warning("Hybrid search failed in semantic route: %s", e)
+
+        # ── Pass 2: community_summaries vector search ─────────────────────────
+        summaries = []
         for _attempt in range(2):
             try:
                 col = self.chroma.get_collection(COMMUNITY_COLLECTION)
                 col_count = col.count()
                 if col_count == 0:
                     logger.warning("Community collection is empty — run global_rollup.py first")
-                    return RouterResult("semantic", [], [], [], [], [], entity_names, [])
+                    break
                 results = col.query(
                     query_texts=[question], n_results=min(20, col_count),
                 )
-                break  # success
+                if results["ids"]:
+                    for i, doc_id in enumerate(results["ids"][0]):
+                        meta = results["metadatas"][0][i]
+                        cid = meta.get("community_id", 0)
+                        summaries.append({
+                            "community_id": cid,
+                            "summary_text": results["documents"][0][i],
+                            "metadata": meta,
+                        })
+                        community_ids.add(cid)
+                break
             except (ConnectionError, TimeoutError, ConnectionAbortedError) as e:
                 if _attempt == 0:
                     logger.warning("ChromaDB connection dropped — reconnecting and retrying")
                     self._reconnect_chroma()
                     continue
                 logger.error("ChromaDB semantic search failed: %s", e)
-                return RouterResult("semantic", [], [], [], [], [], entity_names, [])
+                break
             except Exception as e:
                 logger.error("ChromaDB semantic search failed: %s", e)
-                return RouterResult("semantic", [], [], [], [], [], entity_names, [])
-
-        summaries = []
-        if results["ids"]:
-            for i, doc_id in enumerate(results["ids"][0]):
-                meta = results["metadatas"][0][i]
-                summaries.append({
-                    "community_id": meta.get("community_id", 0),
-                    "summary_text": results["documents"][0][i],
-                    "metadata": meta,
-                })
+                break
 
         return RouterResult(
             route="semantic",
             grep_hits=[],
-            seed_nodes=[],
+            seed_nodes=seed_nodes,
             affected_nodes=[],
-            community_ids=[s["community_id"] for s in summaries],
+            community_ids=sorted(community_ids),
             community_summaries=summaries,
             entity_names=entity_names,
             symbols=[],

@@ -130,6 +130,14 @@ class RepositoryMirror:
         logger.info("Pull complete: %s", dest)
         return dest
 
+    def get_head_sha(self, repo_path: Path) -> str | None:
+        """Return the current HEAD commit SHA for a mirrored repo, or None if unresolvable."""
+        try:
+            return Repo(str(repo_path)).head.commit.hexsha
+        except Exception as e:
+            logger.debug("Could not read HEAD SHA for %s: %s", repo_path, e)
+            return None
+
     def _load_config(self, config_path: Path) -> list[dict]:
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)

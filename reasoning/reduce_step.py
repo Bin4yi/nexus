@@ -33,14 +33,20 @@ _ENCODER = tiktoken.get_encoding("cl100k_base")
 NO_COMMUNITIES_MESSAGE = "No relevant code communities were identified for this query."
 
 _SAFETY_RE = re.compile(
-    r'\b(can i|is it safe|safely|should i|ok to|okay to|safe to|remove|delete|'
-    r'drop|deprecate|eliminate|is .+ used|still used|unused|dead code)\b',
+    r'\b(is it safe|safely remove|safe to remove|safe to delete|ok to remove|okay to remove|'
+    r'can i remove|can i delete|can i drop|should i remove|should i delete|should i drop|'
+    r'is .+ safe to|still used|unused|dead code|'
+    r'(?:remove|delete|drop|deprecate|eliminate)\b.{0,40}\bsafely\b)\b',
     re.IGNORECASE,
 )
 _CODE_RE = re.compile(
     r'\b(show me|show the|give me|display|print|what does .+ look like|'
     r'how is .+ implemented|implementation of|source of|code for|source code of|'
-    r'how does .+ work|read the|view the|open the)\b',
+    r'how does .+ work|read the|view the|open the|'
+    r'how to (introduce|implement|add|integrate|extend|support|enable|write|create)|'
+    r'how do i (introduce|implement|add|integrate|extend|support|enable|write|create)|'
+    r'what (files|classes|methods|code) (should|do) i (change|modify|edit|update|add)|'
+    r'where (should|do) i (add|change|modify|implement))\b',
     re.IGNORECASE,
 )
 _IMPACT_KEYWORDS = frozenset([
@@ -49,10 +55,15 @@ _IMPACT_KEYWORDS = frozenset([
 ])
 
 _CAPABILITY_RE = re.compile(
-    r'\b(does this|does it|is this|is it|can .+ be done|can i .+ without|'
-    r'support|supports|enforce|enforces|require|requires|mandatory|optional|'
-    r'without .+ token|possible to|allowed to|is .+ enforced|is .+ required|'
-    r'is .+ checked|is .+ validated|can .+ bypass|can .+ skip)\b',
+    # Only match true feature/multi-value capability questions — NOT simple enforcement checks
+    # ("is X mandatory?" / "is X required?" are enforcement questions → use GENERAL, not CAPABILITY)
+    r'\b(does this support|does it support|can it support|'
+    r'is it possible to|is it possible for|can .+ be done|can i .+ without|'
+    r'without .+ token|can .+ bypass|can .+ skip|'
+    r'does .+ support multiple|can .+ handle multiple|'
+    r'does .+ allow|is .+ allowed to|'
+    r'does the (code|system|flow|handler|impl) (support|enforce|handle|allow)|'
+    r'is .+ (supported|allowed|enforced|checked|validated|enabled))\b',
     re.IGNORECASE,
 )
 
@@ -63,6 +74,14 @@ _NARRATIVE_RE = re.compile(
     r'how is .+ evaluated|how does .+ evaluate|how are .+ evaluated|'
     r'how does .+ run|how does .+ execute|how does .+ process|'
     r'how does .+ handle|how does .+ perform|'
+    r'how is .+ (done|happen|happening|handled|performed|triggered|invoked|called|'
+    r'checked|validated|processed|enforced|built|constructed|generated|issued|'
+    r'validated|verified|resolved|determined|computed|calculated)|'
+    r'how (does|do|did|is|are|was|were) .+ (work|happen|flow|run|execute|get processed|'
+    r'get validated|get checked|get called|get triggered|get built|get issued)|'
+    r'explain (the |this |how |what ).+(flow|process|validation|mechanism|logic|'
+    r'handling|sequence|chain|pipeline|lifecycle|handshake|handoff|path)|'
+    r'what happens (when|during|after|before|if)|'
     r'explain how|explain the flow|explain the process|explain the sequence|'
     r'from start|beginning to end|step by step|step-by-step|'
     r'full picture|overall flow|full journey|complete flow|'
@@ -258,6 +277,23 @@ SYSTEM_EXPLAIN = (
     "NEVER invent behaviour not visible in the code."
 )
 
+SYSTEM_IMPLEMENTATION = (
+    "You are a senior Java engineer giving implementation guidance grounded in actual source code. "
+    "You have been given the ACTUAL source code read from the repository.\n\n"
+    "YOUR JOB: Show the developer exactly what to change and where.\n\n"
+    "MANDATORY FORMAT:\n"
+    "1. **Relevant existing code** — paste the actual code blocks verbatim (with file path and line numbers).\n"
+    "2. **What to change** — specific methods/classes to modify, with exact file path and line numbers.\n"
+    "3. **New code to add** — show a concrete implementation example or new method in ```java blocks.\n"
+    "4. **Integration points** — where to wire the new code into the existing flow (cite exact class + method).\n\n"
+    "RULES:\n"
+    "- ALWAYS include ```java code blocks. Show actual source lines, not paraphrases.\n"
+    "- Never describe what code does without showing it.\n"
+    "- Cite exact file paths and line numbers for every reference.\n"
+    "- If you show a modification, use a before/after diff format.\n"
+    "- NEVER invent code not derivable from the evidence above."
+)
+
 SYSTEM_DEBUG = (
     "You are a senior Java debugger performing root-cause analysis. "
     "You have been given: the exception/error, the stack trace frames, and the ACTUAL source "
@@ -340,6 +376,37 @@ how it relates to the question. If modifications are suggested, show the
 before/after diff.
 """.strip()
 
+TEMPLATE_IMPLEMENTATION = """
+## Task
+{query}
+
+## Actual Source Code — existing relevant implementation (read from repository mirror)
+{code_snippets}
+
+## Related Methods and Classes (from graph traversal)
+{primary_targets}
+
+## Architectural Context (community summaries)
+{community_summaries}
+
+---
+
+Provide a precise implementation guide for this task.
+
+REQUIRED SECTIONS:
+1. **Existing code to understand** — paste the most relevant existing code blocks verbatim using ```java fenced blocks.
+   Include file path and line numbers as a comment above each block.
+2. **Files to change** — list each file with its exact path and what change is needed.
+3. **New/modified code** — show the concrete implementation in ```java blocks.
+   For modifications, show the full before/after diff of the method or class.
+4. **Wiring** — show exactly where to register/inject/call the new code in the existing flow.
+
+RULES:
+- Every claim must be backed by code in the evidence above.
+- Never describe code without showing it — use ```java blocks throughout.
+- If a required integration point is not visible in the evidence, say so explicitly.
+""".strip()
+
 TEMPLATE_CAPABILITY = """
 ## Question
 {query}
@@ -412,8 +479,11 @@ TEMPLATE_GENERAL = """
 ## Question
 {query}
 
-## Code Evidence — Actual source code read from the repository
+## Code Evidence — Actual source code read from the repository (±10 lines around each grep hit)
 {code_snippets}
+
+## Grep Evidence — Exact line matches in production code
+{grep_evidence}
 
 ## Known Code Entities (file paths and FQNs)
 {primary_targets}
@@ -423,14 +493,20 @@ TEMPLATE_GENERAL = """
 
 ---
 
-Answer from the code evidence ONLY. Do not speculate.
+Answer from the code evidence above. Write a **comprehensive, detailed answer** — do not stop at one paragraph.
 
-**Rules you MUST follow:**
-- Cite specific class names and methods from the evidence when making claims.
-- If the evidence does not confirm an answer, write: "I cannot determine this from the
-  available code evidence. To answer, examine [specific class/method name]."
-- Never give generic advice not supported by the evidence above.
-- Do NOT say things are "likely" or "should" unless the code above proves it.
+**Structure your answer:**
+1. **Direct answer** — state the answer clearly in 1-2 sentences.
+2. **Evidence** — show the relevant code blocks using ```java fenced blocks. Include file path and line numbers.
+3. **How it works** — explain the mechanism step by step, citing specific classes and methods.
+4. **Related context** — mention other classes/methods that interact with this (callers, callees, related checks).
+
+**Rules:**
+- Always include at least one ```java code block with actual source code from the evidence.
+- Cite specific class names, methods, and line numbers for every claim.
+- If the code shows a null-check followed by a throw/exception, state clearly that the field is MANDATORY.
+- If the evidence does not confirm something, say so explicitly rather than speculating.
+- Do NOT stop after one sentence if more detail is available in the evidence.
 """.strip()
 
 TEMPLATE_EXPLAIN = """
@@ -496,6 +572,16 @@ class ReduceStep:
 
     def __init__(self, llm_client: OpenAI | None = None):
         self.llm = llm_client or settings.make_llm_client()
+        # For Azure: use deployment name (llm_query_deployment → llm_deployment → llm_model)
+        # For OpenAI: use model name (llm_query_model → llm_model)
+        if settings.llm_provider.lower() == "azure":
+            self._query_model = (
+                settings.llm_query_deployment
+                or settings.llm_deployment
+                or settings.llm_model
+            )
+        else:
+            self._query_model = settings.llm_query_model or settings.llm_model
 
     def explain(
         self,
@@ -519,7 +605,7 @@ class ReduceStep:
             callees=callees_text or "(no outbound callees found in graph)",
         )
         response = self.llm.chat.completions.create(
-            model=settings.llm_model,
+            model=self._query_model,
             messages=[
                 {"role": "system", "content": SYSTEM_EXPLAIN},
                 {"role": "user",   "content": prompt},
@@ -549,7 +635,7 @@ class ReduceStep:
             grep_evidence=grep_text or "(no throw sites found via grep)",
         )
         response = self.llm.chat.completions.create(
-            model=settings.llm_model,
+            model=self._query_model,
             messages=[
                 {"role": "system", "content": SYSTEM_DEBUG},
                 {"role": "user",   "content": prompt},
@@ -584,7 +670,9 @@ class ReduceStep:
         intent     = self._detect_intent(query)
         if intent == "safety":
             system_msg = SYSTEM_SAFETY
-        elif intent in ("impact", "code"):
+        elif intent == "code":
+            system_msg = SYSTEM_IMPLEMENTATION
+        elif intent == "impact":
             system_msg = SYSTEM_IMPACT
         elif intent == "capability":
             system_msg = SYSTEM_CAPABILITY
@@ -607,7 +695,7 @@ class ReduceStep:
 
         snippets_text = self._format_code_snippets(
             code_snippets or [],
-            budget=NARRATIVE_SNIPPET_BUDGET if intent == "narrative" else SNIPPET_BUDGET,
+            budget=SNIPPET_BUDGET,  # same large budget for all intents — code always first in list
         )
         logger.info(
             "Reduce: intent=%s, grep=%d, graph=%d, communities=%d, snippets=%d",
@@ -617,6 +705,15 @@ class ReduceStep:
         # Guard: if there is literally no evidence at all, bail early.
         if not summaries_text and not snippets_text and not grep_hits and not graph_nodes:
             return NO_COMMUNITIES_MESSAGE
+
+        # Guard: safety/impact queries with no grep or code evidence are unreliable.
+        # Community summaries alone cannot prove a constant is unused — refuse to guess.
+        if intent in ("safety", "impact") and not grep_hits and not graph_nodes and not snippets_text:
+            return (
+                "I cannot give a safe removal verdict without grep evidence. "
+                "Try rephrasing with the exact UPPER_SNAKE_CASE constant name (e.g. IMPERSONATING_ACTOR) "
+                "so the router can search the codebase for actual usages."
+            )
 
         # Build prompt based on intent
         if intent == "narrative":
@@ -628,10 +725,10 @@ class ReduceStep:
                 community_summaries=summaries_text or "(no community data — relying on code snippets and grep evidence above)",
             )
         elif intent == "code":
-            prompt = TEMPLATE_CODE.format(
+            prompt = TEMPLATE_IMPLEMENTATION.format(
                 query=query or "(no query)",
-                code_snippets=snippets_text,
-                primary_targets=targets_text,
+                code_snippets=snippets_text or "(no source code fetched from mirror)",
+                primary_targets=targets_text or "(no specific code entities found)",
                 community_summaries=summaries_text or "(no community data)",
             )
         elif intent == "safety":
@@ -647,7 +744,7 @@ class ReduceStep:
                 grep_evidence=grep_text or "(no grep evidence — no relevant symbols found in codebase)",
                 community_summaries=summaries_text or "(no community data)",
             )
-        elif intent == "impact" or grep_hits or graph_nodes:
+        elif intent == "impact":
             prompt = TEMPLATE_IMPACT.format(
                 query=query or "(no query)",
                 grep_evidence=grep_text,
@@ -655,26 +752,35 @@ class ReduceStep:
                 community_summaries=summaries_text or "(no community data)",
             )
         else:
-            # General
+            # General — include all evidence sources
             prompt = TEMPLATE_GENERAL.format(
                 query=query or "(no query)",
                 code_snippets=snippets_text or "(no source code fetched)",
+                grep_evidence=grep_text or "(no grep evidence found)",
                 primary_targets=targets_text or "(no specific code entities found)",
                 community_summaries=summaries_text or "(no community data)",
             )
 
-        # Narrative/general queries need much more output space for a complete story.
-        output_tokens = NARRATIVE_RESERVE if intent in ("narrative", "general") else OUTPUT_RESERVE
+        # Narrative/code/general queries get full output space for comprehensive answers.
+        output_tokens = NARRATIVE_RESERVE if intent in ("narrative", "code", "general") else OUTPUT_RESERVE
 
-        response = self.llm.chat.completions.create(
-            model=settings.llm_model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": prompt},
-            ],
-            max_completion_tokens=output_tokens,
-        )
-        review = response.choices[0].message.content.strip()
+        try:
+            response = self.llm.chat.completions.create(
+                model=self._query_model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": prompt},
+                ],
+                max_completion_tokens=output_tokens,
+            )
+            review = response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error("LLM call failed (model=%s): %s", self._query_model, e)
+            return (
+                f"[LLM error: {type(e).__name__} — model '{self._query_model}' may not be "
+                f"available on this Azure endpoint. Set LLM_QUERY_DEPLOYMENT to a valid "
+                f"deployment name in .env and restart.]\n\nError: {e}"
+            )
         logger.info("Reduce complete — %d chars", len(review))
         return review
 
@@ -682,6 +788,9 @@ class ReduceStep:
         summaries_text, _ = self._build_summaries_text(map_results)
         prompt = TEMPLATE_GENERAL.format(
             query="test",
+            code_snippets="",
+            grep_evidence="",
+            primary_targets="",
             community_summaries=summaries_text,
         )
         return len(_ENCODER.encode(SYSTEM_IMPACT + prompt))
@@ -712,7 +821,7 @@ class ReduceStep:
         )
 
         response = self.llm.chat.completions.create(
-            model=settings.llm_model,
+            model=self._query_model,
             messages=[
                 {"role": "system", "content": SYSTEM_GLOBAL},
                 {"role": "user",   "content": prompt},

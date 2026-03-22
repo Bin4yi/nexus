@@ -64,6 +64,14 @@ class Settings(BaseSettings):
         default="gpt-4o",
         description="Model for intelligence: final reduce answer, L3 global rollup only.",
     )
+    llm_query_model: str = Field(
+        default="",
+        description="Override model for user-facing query answers (reduce step). Defaults to llm_model when empty.",
+    )
+    llm_query_deployment: str = Field(
+        default="",
+        description="Azure deployment name for query answers. Defaults to llm_deployment when empty.",
+    )
     # Azure OpenAI settings (used when llm_provider="azure")
     llm_azure_endpoint: str = Field(
         default="",

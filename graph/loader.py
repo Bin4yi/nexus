@@ -50,6 +50,27 @@ class Neo4jLoader:
 
     # â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    def get_ingested_sha(self, repo_name: str) -> str | None:
+        """Return the last successfully ingested commit SHA for a repo, or None if not yet ingested."""
+        with self.driver.session() as session:
+            result = session.run(
+                "MATCH (p:Project {name: $name}) RETURN p.last_ingested_sha AS sha",
+                name=repo_name,
+            )
+            record = result.single()
+            return record["sha"] if record else None
+
+    def set_ingested_sha(self, repo_name: str, sha: str) -> None:
+        """Record the commit SHA of a successfully completed ingest for a repo."""
+        with self.driver.session() as session:
+            session.run(
+                """
+                MERGE (p:Project {name: $name})
+                SET p.last_ingested_sha = $sha, p.last_indexed = datetime()
+                """,
+                name=repo_name, sha=sha,
+            ).consume()
+
     def load_project(self, project: Project) -> None:
         """Load a full Project hierarchy into Neo4j (Tier 1: skeleton nodes)."""
         with self.driver.session() as session:

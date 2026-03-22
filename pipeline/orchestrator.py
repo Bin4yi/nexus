@@ -114,6 +114,7 @@ class IngestionPipeline:
             "communities":       0,
             "l2_subsystems":     0,
             "l3_global":         False,
+            "skipped_repos":     0,
         }
 
         # ── Apply schema (idempotent) ─────────────────────────────────────────
@@ -137,13 +138,37 @@ class IngestionPipeline:
         # Per-repo data for Maven/dependency wiring
         repo_module_data: list[tuple[str, list]] = []  # (mod_geid, dep_edges)
 
+        # Track which repos are newly ingested vs skipped — post-processing only
+        # runs Leiden + summarization when at least one repo changed.
+        new_repo_shas: dict[str, str] = {}   # repo_name → HEAD sha (only for processed repos)
+        skipped_repos: list[str] = []
+
         for repo_path in local_paths:
-            repo_path = repo_path.resolve()  # absolute path — avoids Windows MAX_PATH on deep Java trees
-            # On Windows, use \\?\ prefix so file I/O bypasses 260-char MAX_PATH
+            # Resolve to absolute path — avoids Windows MAX_PATH on deep Java trees
+            repo_path = repo_path.resolve()
             import sys as _sys
             if _sys.platform == "win32":
                 repo_path = Path("\\\\?\\" + str(repo_path))
             repo_name = repo_path.name
+
+            # ── Incremental skip: compare HEAD SHA against last ingested SHA ──
+            current_sha = self.mirror.get_head_sha(repo_path)
+            stored_sha  = self.loader.get_ingested_sha(repo_name)
+            if current_sha and stored_sha and current_sha == stored_sha:
+                logger.info(
+                    "Skipping repo '%s' — HEAD %s already ingested",
+                    repo_name, current_sha[:8],
+                )
+                skipped_repos.append(repo_name)
+                # Still collect java files for cross-repo OSGi / call-graph passes
+                all_java_files.extend(
+                    f for f in repo_path.rglob("*.java")
+                    if "src/main/java" in str(f).replace("\\", "/")
+                    or "src\\main\\java" in str(f)
+                )
+                continue   # skip re-parsing, re-loading, re-embedding
+
+            new_repo_shas[repo_name] = current_sha or ""
             java_files = [
                 f for f in repo_path.rglob("*.java")
                 if "src/main/java" in str(f).replace("\\", "/")
@@ -212,6 +237,10 @@ class IngestionPipeline:
             # ── Stage 4b: Embed into ChromaDB (chunks already built by workers) ──
             embed_chunks = [EmbeddingChunk(**cd) for cd in chunk_dicts]
             self.embedder.upsert_chunks(embed_chunks)
+
+            # ── Record successful ingest SHA so next run can skip this repo ──
+            if new_repo_shas.get(repo_name):
+                self.loader.set_ingested_sha(repo_name, new_repo_shas[repo_name])
 
             # ── Stage 2b: Scan SQL schemas + Config files (Sprint 2) ─────────
             db_tables = self.sql_parser.scan_sql_scripts(repo_path, repo_name)
@@ -361,6 +390,22 @@ class IngestionPipeline:
 
         logger.info("Stage 3 complete — all relationship tiers loaded")
 
+        # ── Skip post-processing if no repos changed ─────────────────────────
+        if not new_repo_shas:
+            logger.info(
+                "All %d repos already up-to-date — skipping Leiden, summarization, "
+                "tagging, flow extraction, and global rollup.",
+                len(skipped_repos),
+            )
+            stats["skipped_repos"] = len(skipped_repos)
+            self._set_status("stage", "done")
+            return stats
+        logger.info(
+            "%d repo(s) changed (%s), %d skipped — running post-processing",
+            len(new_repo_shas), list(new_repo_shas), len(skipped_repos),
+        )
+        stats["skipped_repos"] = len(skipped_repos)
+
         # ── Post: Leiden community detection ──────────────────────────────────
         self._set_status("stage", "leiden")
         leiden_result = self.gds.run_leiden(
@@ -379,9 +424,10 @@ class IngestionPipeline:
 
         # ── Post: EntryPoint / DataSink tagging (TASK 2) ─────────────────────
         self._set_status("stage", "tagging")
-        tag_stats = self.tagger.tag_all()
-        stats["entry_points"] = tag_stats["entry_points"]
-        stats["data_sinks"] = tag_stats["data_sinks"]
+        self.tagger.tag_all()
+        # Use actual graph counts (not newly-tagged counts) so re-ingest works correctly
+        stats["entry_points"] = self.tagger.get_entry_point_count()
+        stats["data_sinks"] = self.tagger.get_data_sink_count()
         logger.info(
             "Tagging complete — %d EntryPoints, %d DataSinks",
             stats["entry_points"], stats["data_sinks"],

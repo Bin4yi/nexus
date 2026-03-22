@@ -59,6 +59,19 @@ class CodeFetcher:
             return None
         return self._read_range(fp, fqn, int(s), int(e), context_lines)
 
+    def fetch_for_nodes(self, nodes: list[dict], context_lines: int = 0) -> list:
+        """
+        Batch fetch code snippets for a list of node dicts.
+        Each node must have: file_path, fqn, start_line, end_line.
+        Skips nodes that are missing required fields. Returns only successful fetches.
+        """
+        snippets = []
+        for node in nodes:
+            snippet = self.fetch_method(node, context_lines=context_lines)
+            if snippet is not None:
+                snippets.append(snippet)
+        return snippets
+
     def fetch_grep_context(self, file_path: str, line_number: int,
                            context_lines: int = 5) -> CodeSnippet | None:
         """
@@ -122,17 +135,22 @@ class CodeFetcher:
 
     def _resolve(self, file_path: str) -> Path | None:
         """Resolve a file path (absolute or relative to mirror root) to a Path."""
-        fp = Path(file_path)
+        # Strip Windows extended-length prefix \\?\ which breaks pathlib.exists()
+        norm_str = file_path
+        if norm_str.startswith("\\\\?\\"):
+            norm_str = norm_str[4:]
+
+        fp = Path(norm_str)
         if fp.is_absolute() and fp.exists():
             return fp
 
         # Try as relative to mirror root
-        candidate = MIRROR_ROOT / file_path.replace("\\", "/")
+        candidate = MIRROR_ROOT / norm_str.replace("\\", "/")
         if candidate.exists():
             return candidate
 
         # Strip leading mirror/ prefix if present
-        norm = file_path.replace("\\", "/")
+        norm = norm_str.replace("\\", "/")
         if norm.startswith("mirror/"):
             norm = norm[len("mirror/"):]
         candidate2 = MIRROR_ROOT / norm
