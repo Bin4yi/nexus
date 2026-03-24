@@ -48,12 +48,15 @@ class RepositoryMirror:
         repos = self._load_config(config_path)
         local_paths = []
         for repo_cfg in repos:
-            local_path = self.mirror_repo(
-                name=repo_cfg["name"],
-                url=repo_cfg["url"],
-                branch=repo_cfg.get("branch", "main"),
-            )
-            local_paths.append(local_path)
+            try:
+                local_path = self.mirror_repo(
+                    name=repo_cfg["name"],
+                    url=repo_cfg["url"],
+                    branch=repo_cfg.get("branch", "main"),
+                )
+                local_paths.append(local_path)
+            except MirrorError as e:
+                logger.warning("Skipping repo %s — %s", repo_cfg["name"], e)
         return local_paths
 
     def mirror_repo(self, name: str, url: str, branch: str = "main") -> Path:

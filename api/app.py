@@ -193,12 +193,21 @@ async def query(req: QueryRequest, _=Depends(verify_api_key)):
     for node in result.affected_nodes[:10]:
         primary_targets.append({**node, "source": "graph"})
 
-    # Fetch actual source code — one snippet per file (best hit), then node method bodies.
+    # Fetch actual source code.
+    # ORDERING: graph entity method bodies FIRST, then grep contexts from implementation files only.
+    # Constant-definition files (OAuthConstants etc.) are skipped from code snippets —
+    # they're already in grep_evidence. This ensures TokenExchangeGrantHandler-type bodies
+    # appear before broad grep hits from unrelated flows (e.g. CIBA when asking about token exchange).
     code_snippets = []
     try:
         from reasoning.code_fetcher import CodeFetcher
         fetcher = CodeFetcher()
-        # Pass 1: best grep hit per file — avoids same file eating all snippet slots
+        # Pass 1: graph/semantic method bodies — graph nodes first (entity lookup), then semantic
+        fetchable = [t for t in primary_targets if t.get("file_path") and t.get("start_line")]
+        fetchable.sort(key=lambda t: 0 if t.get("source") == "graph" else 1)
+        node_snippets = fetcher.fetch_for_nodes(fetchable[:12])
+        code_snippets.extend(node_snippets)
+        # Pass 2: grep contexts — implementation files only (score >= 2), skip constants + tests
         file_best: dict[str, dict] = {}
         for t in primary_targets:
             if t.get("source") != "grep":
@@ -213,14 +222,12 @@ async def query(req: QueryRequest, _=Depends(verify_api_key)):
             score = 0 if (is_import or is_defn) else (1 if is_test else 2)
             if fp not in file_best or score > file_best[fp]["score"]:
                 file_best[fp] = {**t, "score": score}
-        for fp, t in list(file_best.items())[:10]:
-            snippet = fetcher.fetch_grep_context(fp, t["line_number"], context_lines=10)
+        for fp, t in list(file_best.items())[:15]:
+            if t["score"] < 2:
+                continue  # Skip constant definitions and tests — shown in grep_evidence
+            snippet = fetcher.fetch_grep_context(fp, t["line_number"], context_lines=20)
             if snippet:
                 code_snippets.append(snippet)
-        # Pass 2: graph/semantic nodes with full method bodies
-        fetchable = [t for t in primary_targets if t.get("file_path") and t.get("start_line")]
-        node_snippets = fetcher.fetch_for_nodes(fetchable[:6])
-        code_snippets.extend(node_snippets)
     except Exception as e:
         logger.debug("Code fetch failed for query: %s", e)
 

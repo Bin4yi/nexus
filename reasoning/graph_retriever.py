@@ -59,6 +59,17 @@ class GraphRetriever:
     def __init__(self, chroma_client=None):
         self._driver = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
         self._chroma = chroma_client
+        # Pre-load the SentenceTransformer embedding model once at startup.
+        # Without this, ChromaEmbedder gets re-instantiated on every query,
+        # reloading the BERT weights from disk each time (~5-10s overhead per query).
+        self._embedder = None
+        if chroma_client:
+            try:
+                from vectorstore.embedder import ChromaEmbedder
+                self._embedder = ChromaEmbedder(chroma_client)
+                logger.info("Embedding model loaded at startup (cached for all queries).")
+            except Exception as e:
+                logger.warning("Could not pre-load embedder: %s", e)
 
     def close(self):
         self._driver.close()
@@ -258,9 +269,11 @@ class GraphRetriever:
                     collection="code_intent",
                     n_results=n_results,
                 )
-            # Raw chroma client fallback
-            from vectorstore.embedder import ChromaEmbedder
-            embedder_obj = ChromaEmbedder(chroma_embedder)
+            # Use cached embedder (loaded once at startup) to avoid reloading BERT weights
+            embedder_obj = self._embedder
+            if embedder_obj is None:
+                from vectorstore.embedder import ChromaEmbedder
+                embedder_obj = ChromaEmbedder(chroma_embedder)
             return embedder_obj.semantic_search(
                 query=query,
                 collection="code_intent",
@@ -356,6 +369,54 @@ class GraphRetriever:
                 })
         logger.info("code_intent literal search for '%s' → %d method hits", entity_name, len(hits))
         return hits
+
+    @_neo4j_retry
+    def get_class_methods(self, class_fqns: list[str]) -> list[dict]:
+        """
+        Given a list of LogicUnit FQNs, return all sibling LogicUnit nodes that
+        belong to the same Component (class).
+
+        This ensures that when one method of a class is found as a seed, the
+        entire class API surface is available to the LLM — not just the one
+        method that happened to have good embeddings.
+
+        Example: validateSubjectToken found → also returns validateActorToken,
+        validateGrant, setSubjectAsAuthorizedUser, resolveImpersonator, etc.
+        """
+        if not class_fqns:
+            return []
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (lu:LogicUnit)
+                WHERE lu.fqn IN $fqns
+                MATCH (c:Component)-[:HAS_METHOD]->(lu)
+                MATCH (c)-[:HAS_METHOD]->(sibling:LogicUnit)
+                RETURN DISTINCT sibling.fqn       AS fqn,
+                                sibling.file_path  AS file_path,
+                                sibling.start_line AS start_line,
+                                sibling.end_line   AS end_line,
+                                sibling.community_id AS community_id
+                ORDER BY sibling.start_line
+                """,
+                fqns=class_fqns,
+            )
+            siblings = []
+            for row in result:
+                fp = row["file_path"] or ""
+                if "mirror" in fp:
+                    fp = fp[fp.find("mirror"):]
+                siblings.append({
+                    "fqn":          row["fqn"],
+                    "file_path":    fp,
+                    "start_line":   row["start_line"],
+                    "end_line":     row["end_line"],
+                    "community_id": row["community_id"],
+                    "label":        "LogicUnit",
+                    "source":       "sibling",
+                })
+            logger.info("Class sibling expansion: %d input FQNs → %d sibling methods", len(class_fqns), len(siblings))
+            return siblings
 
     @_neo4j_retry
     def get_blast_radius_communities(

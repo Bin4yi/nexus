@@ -18,7 +18,62 @@ repositories:
     branch: master
     language: java
 
-  # - name: identity-api-server
-  #   url: https://github.com/Thumimku/identity-api-server.git
-  #   branch: feature-authz
-  #   language: java
+# 1. The Underlying Foundation
+  # Why: This is the absolute base of all WSO2 products. Ingesting this will resolve thousands of base class inheritances and core OSGi lifecycle methods.
+  - name: carbon-kernel
+    url: https://github.com/wso2/carbon-kernel
+    branch: master
+
+  # 2. The REST API Layer
+  # Why: This repo contains the modern REST APIs for WSO2 IS. It will flood your graph with :EntryPoint nodes (@Path, @GET, @POST), allowing your Flow Extractor to trace API calls down to the database.
+  - name: identity-api-server
+    url: https://github.com/wso2/identity-api-server
+    branch: master
+
+  # 3. SAML Inbound Authentication
+  # Why: Alongside OAuth2, SAML is the other massive protocol in IAM. This completes your inbound authentication graph.
+  - name: identity-inbound-auth-saml
+    url: https://github.com/wso2-extensions/identity-inbound-auth-saml
+    branch: master
+
+  # 4. Identity Management & Recovery
+  # Why: Contains the logic for password recovery, self-signup, and account confirmations. Highly connected to the framework repo.
+  - name: carbon-identity-mgt
+    url: https://github.com/wso2/carbon-identity-mgt
+    branch: master
+
+  # 5. Basic Authenticator
+  # Why: The default username/password authenticator. Essential for tracing the most common login execution flows.
+  - name: identity-local-auth-basicauth
+    url: https://github.com/wso2-extensions/identity-local-auth-basicauth
+    branch: master
+
+  # 6. Adaptive Authentication (Conditional Auth)
+  # Why: This repo contains the engine and functions for JavaScript-based adaptive authentication (e.g., checking IPs, roles during login).
+  - name: identity-conditional-auth-functions
+    url: https://github.com/wso2-extensions/identity-conditional-auth-functions
+    branch: master
+
+  # 7. Identity Governance
+  # Why: Handles password policies, account locking, and idle account suspension. It heavily interacts with the database (producing :DataSink nodes).
+  - name: identity-governance
+    url: https://github.com/wso2-extensions/identity-governance
+    branch: master
+
+  # 8. OIDC Outbound Federation
+  # Why: If WSO2 is acting as a federated proxy (logging in with Google/Azure), this repo handles the outbound token exchange.
+  - name: identity-outbound-auth-oidc
+    url: https://github.com/wso2-extensions/identity-outbound-auth-oidc
+    branch: master
+
+  # 9. SAML Outbound Federation
+  # Why: Similar to the above, handles outbound SAML federation. Together with OIDC outbound, this completes your federation knowledge graph.
+  - name: identity-outbound-auth-saml
+    url: https://github.com/wso2-extensions/identity-outbound-auth-saml
+    branch: master
+
+  # 10. The Product Assembly
+  # Why: Contains the final dbscripts/ (which your SQL parser needs to map CREATE TABLE statements to :DataSink nodes) and the main deployment.toml configurations.
+  - name: product-is
+    url: https://github.com/wso2/product-is
+    branch: master

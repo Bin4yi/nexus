@@ -23,7 +23,7 @@ import re
 import tiktoken
 from openai import OpenAI
 
-from config.settings import settings
+from config.settings import settings, llm_chat
 from reasoning.map_step import MapResult
 
 logger = logging.getLogger(__name__)
@@ -111,21 +111,23 @@ def detect_query_intent(query: str) -> str:
         return "narrative"
     return "general"
 
-MAX_TOKENS     = settings.max_context_tokens   # hard ceiling
+MAX_TOKENS     = settings.max_context_tokens   # hard ceiling (default 32k, gpt-4o-mini supports 128k)
 SYSTEM_TOKENS  = 200
-OUTPUT_RESERVE = 1800          # default for safety/capability/impact/code
-NARRATIVE_RESERVE = 6000       # for story/walkthrough/explain-flow queries
+OUTPUT_RESERVE = 6000          # default for safety/capability/impact — room for a solid answer
+NARRATIVE_RESERVE = 20000      # for story/walkthrough/explain-flow — gpt-5 burns ~8-12k on internal reasoning before writing
 DATA_BUDGET    = MAX_TOKENS - SYSTEM_TOKENS - OUTPUT_RESERVE  # token budget for input data
 
-# Hard sub-budgets that together fit within MAX_TOKENS.
-SNIPPET_BUDGET          = int(DATA_BUDGET * 0.50)
-SUMMARY_BUDGET          = int(DATA_BUDGET * 0.40)
+# Code snippets get 65% of the input budget — the primary signal for a code assistant.
+# Community summaries get 30% — architectural context.
+# Evidence (grep list) gets the remaining 5%.
+SNIPPET_BUDGET          = int(DATA_BUDGET * 0.65)
+SUMMARY_BUDGET          = int(DATA_BUDGET * 0.30)
 EVIDENCE_BUDGET         = DATA_BUDGET - SNIPPET_BUDGET - SUMMARY_BUDGET
 
-# For narrative queries we push much more context to the model.
-NARRATIVE_DATA_BUDGET   = MAX_TOKENS - SYSTEM_TOKENS - NARRATIVE_RESERVE  # remaining after output reserve
-NARRATIVE_SUMMARY_BUDGET = int(NARRATIVE_DATA_BUDGET * 0.50)  # 50% of data budget for community summaries
-NARRATIVE_SNIPPET_BUDGET = int(NARRATIVE_DATA_BUDGET * 0.40)  # 40% for code snippets
+# For narrative queries — same ratios, but output reserve is larger.
+NARRATIVE_DATA_BUDGET    = MAX_TOKENS - SYSTEM_TOKENS - NARRATIVE_RESERVE
+NARRATIVE_SUMMARY_BUDGET = int(NARRATIVE_DATA_BUDGET * 0.35)  # 35% summaries
+NARRATIVE_SNIPPET_BUDGET = int(NARRATIVE_DATA_BUDGET * 0.60)  # 60% code (more code for story)
 
 NO_COMMUNITIES_MESSAGE = "No relevant code communities were identified for this query."
 
@@ -184,13 +186,13 @@ Be specific: name subsystems, key classes, and how they relate.
 """.strip()
 
 SYSTEM_GENERAL = (
-    "You are a code analysis assistant for WSO2 Java repositories. "
-    "You MUST answer ONLY from the code evidence provided (grep hits, code snippets, community summaries). "
-    "If the evidence does not contain enough information to answer with certainty, "
-    "say 'I cannot determine this from the available code evidence' and name the specific "
-    "class/method that would need to be examined. "
-    "NEVER speculate, NEVER invent behaviour, NEVER give generic security advice. "
-    "If you don't know, say you don't know."
+    "You are a code knowledge base for WSO2 Java repositories. "
+    "Your job is to show what code ALREADY EXISTS that is relevant to the question — "
+    "not to give instructions, not to write new code.\n\n"
+    "ALWAYS show the actual code using ```java fenced blocks with file path and line numbers. "
+    "Explain what the existing code does. "
+    "If something is not in the evidence, say so and name the class/method that would contain it. "
+    "NEVER speculate. NEVER invent code. NEVER give generic advice."
 )
 
 SYSTEM_NARRATIVE = (
@@ -278,20 +280,22 @@ SYSTEM_EXPLAIN = (
 )
 
 SYSTEM_IMPLEMENTATION = (
-    "You are a senior Java engineer giving implementation guidance grounded in actual source code. "
-    "You have been given the ACTUAL source code read from the repository.\n\n"
-    "YOUR JOB: Show the developer exactly what to change and where.\n\n"
-    "MANDATORY FORMAT:\n"
-    "1. **Relevant existing code** — paste the actual code blocks verbatim (with file path and line numbers).\n"
-    "2. **What to change** — specific methods/classes to modify, with exact file path and line numbers.\n"
-    "3. **New code to add** — show a concrete implementation example or new method in ```java blocks.\n"
-    "4. **Integration points** — where to wire the new code into the existing flow (cite exact class + method).\n\n"
+    "You are a code knowledge base. Your ONLY job is to surface what code ALREADY EXISTS "
+    "in the repository that is relevant to the developer's question.\n\n"
+    "WHAT TO DO:\n"
+    "- Show every relevant code block verbatim using ```java fenced blocks.\n"
+    "- For each block: state the file path, line numbers, and what it does.\n"
+    "- Explain how the existing pieces connect to each other.\n"
+    "- If something is NOT implemented yet in the evidence, say so explicitly.\n\n"
+    "WHAT NOT TO DO:\n"
+    "- DO NOT write new code that is not in the evidence.\n"
+    "- DO NOT create 'Files to change' or 'New/modified code' sections.\n"
+    "- DO NOT give step-by-step instructions.\n"
+    "- DO NOT invent methods, classes, or logic not visible in the evidence.\n\n"
     "RULES:\n"
-    "- ALWAYS include ```java code blocks. Show actual source lines, not paraphrases.\n"
-    "- Never describe what code does without showing it.\n"
-    "- Cite exact file paths and line numbers for every reference.\n"
-    "- If you show a modification, use a before/after diff format.\n"
-    "- NEVER invent code not derivable from the evidence above."
+    "- Every claim must be backed by a code block from the evidence.\n"
+    "- Cite exact file path and line number for every reference.\n"
+    "- If the relevant code is absent from the evidence, say 'not found in indexed code'."
 )
 
 SYSTEM_DEBUG = (
@@ -377,10 +381,10 @@ before/after diff.
 """.strip()
 
 TEMPLATE_IMPLEMENTATION = """
-## Task
+## Question
 {query}
 
-## Actual Source Code — existing relevant implementation (read from repository mirror)
+## Actual Source Code (read directly from repository mirror)
 {code_snippets}
 
 ## Related Methods and Classes (from graph traversal)
@@ -391,20 +395,19 @@ TEMPLATE_IMPLEMENTATION = """
 
 ---
 
-Provide a precise implementation guide for this task.
+Show the developer what ALREADY EXISTS in the codebase that is relevant to this question.
 
 REQUIRED SECTIONS:
-1. **Existing code to understand** — paste the most relevant existing code blocks verbatim using ```java fenced blocks.
-   Include file path and line numbers as a comment above each block.
-2. **Files to change** — list each file with its exact path and what change is needed.
-3. **New/modified code** — show the concrete implementation in ```java blocks.
-   For modifications, show the full before/after diff of the method or class.
-4. **Wiring** — show exactly where to register/inject/call the new code in the existing flow.
+1. **What already exists** — show every relevant code block verbatim using ```java fenced blocks.
+   Include file path and line numbers above each block. Show ALL relevant snippets from the evidence.
+2. **How they connect** — explain which classes call which, and what each does. Cite file + line.
+3. **What is NOT yet implemented** — if the question asks about a feature not visible in the evidence,
+   state exactly which class/method would contain it and that it is not found in the indexed code.
 
 RULES:
-- Every claim must be backed by code in the evidence above.
-- Never describe code without showing it — use ```java blocks throughout.
-- If a required integration point is not visible in the evidence, say so explicitly.
+- Show code first, explain after. Use ```java blocks for every code reference.
+- NEVER write new code. NEVER suggest changes. Only show what exists.
+- If something is absent from the evidence, say "not found in indexed code — would likely be in <ClassName>".
 """.strip()
 
 TEMPLATE_CAPABILITY = """
@@ -493,20 +496,20 @@ TEMPLATE_GENERAL = """
 
 ---
 
-Answer from the code evidence above. Write a **comprehensive, detailed answer** — do not stop at one paragraph.
+Show what code EXISTS in the repository that answers this question. This is a knowledge base — show code, don't give instructions.
 
-**Structure your answer:**
-1. **Direct answer** — state the answer clearly in 1-2 sentences.
-2. **Evidence** — show the relevant code blocks using ```java fenced blocks. Include file path and line numbers.
-3. **How it works** — explain the mechanism step by step, citing specific classes and methods.
-4. **Related context** — mention other classes/methods that interact with this (callers, callees, related checks).
+**Structure:**
+1. **Direct answer** — 1-2 sentences stating what the code shows.
+2. **Relevant code** — paste every relevant code block verbatim using ```java fenced blocks with file path + line numbers.
+   Show ALL snippets from the evidence that are relevant — don't skip files.
+3. **What each piece does** — for each code block, explain its role. Cite class name, method, line.
+4. **Connections** — how do the shown pieces relate to each other? Who calls who?
 
 **Rules:**
-- Always include at least one ```java code block with actual source code from the evidence.
-- Cite specific class names, methods, and line numbers for every claim.
-- If the code shows a null-check followed by a throw/exception, state clearly that the field is MANDATORY.
-- If the evidence does not confirm something, say so explicitly rather than speculating.
-- Do NOT stop after one sentence if more detail is available in the evidence.
+- Code blocks first, explanation after. Never describe code without showing it.
+- NEVER write new code. NEVER suggest changes. Only show what already exists.
+- If the evidence shows a null-check + throw, state the field is MANDATORY (cite line).
+- If something is not in the evidence, say "not found in indexed code".
 """.strip()
 
 TEMPLATE_EXPLAIN = """
@@ -604,15 +607,7 @@ class ReduceStep:
             callers=callers_text or "(no inbound callers found in graph)",
             callees=callees_text or "(no outbound callees found in graph)",
         )
-        response = self.llm.chat.completions.create(
-            model=self._query_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_EXPLAIN},
-                {"role": "user",   "content": prompt},
-            ],
-            max_completion_tokens=OUTPUT_RESERVE,
-        )
-        return response.choices[0].message.content.strip()
+        return llm_chat(self.llm, self._query_model, SYSTEM_EXPLAIN, prompt, OUTPUT_RESERVE)
 
     def debug_error(
         self,
@@ -634,15 +629,7 @@ class ReduceStep:
             code_snippets=snippets_text or "(source not readable from mirror)",
             grep_evidence=grep_text or "(no throw sites found via grep)",
         )
-        response = self.llm.chat.completions.create(
-            model=self._query_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_DEBUG},
-                {"role": "user",   "content": prompt},
-            ],
-            max_completion_tokens=OUTPUT_RESERVE,
-        )
-        return response.choices[0].message.content.strip()
+        return llm_chat(self.llm, self._query_model, SYSTEM_DEBUG, prompt, OUTPUT_RESERVE)
 
     def run(
         self,
@@ -651,6 +638,7 @@ class ReduceStep:
         primary_targets: list[dict] | None = None,
         code_snippets: list | None = None,    # CodeSnippet objects from CodeFetcher
         route: str = "",
+        on_token=None,        # optional callable(str) — streams final answer tokens to caller
     ) -> str:
         """
         Execute the reduce step with intent-aware prompting.
@@ -695,7 +683,7 @@ class ReduceStep:
 
         snippets_text = self._format_code_snippets(
             code_snippets or [],
-            budget=SNIPPET_BUDGET,  # same large budget for all intents — code always first in list
+            budget=NARRATIVE_SNIPPET_BUDGET if intent == "narrative" else SNIPPET_BUDGET,
         )
         logger.info(
             "Reduce: intent=%s, grep=%d, graph=%d, communities=%d, snippets=%d",
@@ -765,15 +753,8 @@ class ReduceStep:
         output_tokens = NARRATIVE_RESERVE if intent in ("narrative", "code", "general") else OUTPUT_RESERVE
 
         try:
-            response = self.llm.chat.completions.create(
-                model=self._query_model,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": prompt},
-                ],
-                max_completion_tokens=output_tokens,
-            )
-            review = response.choices[0].message.content.strip()
+            review = llm_chat(self.llm, self._query_model, system_msg, prompt, output_tokens,
+                              on_token=on_token)
         except Exception as e:
             logger.error("LLM call failed (model=%s): %s", self._query_model, e)
             return (
@@ -820,15 +801,7 @@ class ReduceStep:
             subsystem_summaries=subsystem_summaries,
         )
 
-        response = self.llm.chat.completions.create(
-            model=self._query_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_GLOBAL},
-                {"role": "user",   "content": prompt},
-            ],
-            max_completion_tokens=NARRATIVE_RESERVE,
-        )
-        answer = response.choices[0].message.content.strip()
+        answer = llm_chat(self.llm, self._query_model, SYSTEM_GLOBAL, prompt, NARRATIVE_RESERVE)
         logger.info("Global reduce complete — %d chars", len(answer))
         return answer
 

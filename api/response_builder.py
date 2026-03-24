@@ -63,11 +63,14 @@ def _extract_sources(result: RouterResult) -> list[SourceRef]:
     # 1. Grep hits (Route A) — have exact file:line
     for hit in result.grep_hits:
         if isinstance(hit, GrepHit):
-            fqn  = getattr(hit, "fqn", "") or hit.rel_path
+            rel  = getattr(hit, "rel_path", "") or ""
+            # Show class name (e.g. "TokenExchangeGrantHandler"), not the full path ending in ".java"
+            fqn  = rel.replace("\\", "/").split("/")[-1].replace(".java", "") if rel else ""
             line = getattr(hit, "line_number", None)
             text = getattr(hit, "text", "")
         elif isinstance(hit, dict):
-            fqn  = hit.get("fqn", "") or hit.get("file_path", "")
+            rel  = hit.get("file_path", "") or ""
+            fqn  = rel.replace("\\", "/").split("/")[-1].replace(".java", "") if rel else hit.get("fqn", "")
             line = hit.get("line_number")
             text = hit.get("text", "")
         else:

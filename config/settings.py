@@ -66,11 +66,27 @@ class Settings(BaseSettings):
     )
     llm_query_model: str = Field(
         default="",
-        description="Override model for user-facing query answers (reduce step). Defaults to llm_model when empty.",
+        description=(
+            "Model for user-facing final answers (ReduceStep). "
+            "Set to your strongest model — this is what the developer reads. "
+            "Defaults to llm_model when empty."
+        ),
+    )
+    llm_parser_model: str = Field(
+        default="",
+        description=(
+            "Model for LLM query parsing (entity extraction, intent classification, typo fixing). "
+            "Runs on every query before retrieval — use a fast model. "
+            "Defaults to llm_model when empty."
+        ),
     )
     llm_query_deployment: str = Field(
         default="",
         description="Azure deployment name for query answers. Defaults to llm_deployment when empty.",
+    )
+    llm_parser_deployment: str = Field(
+        default="",
+        description="Azure deployment name for query parser. Defaults to llm_deployment when empty.",
     )
     # Azure OpenAI settings (used when llm_provider="azure")
     llm_azure_endpoint: str = Field(
@@ -89,8 +105,9 @@ class Settings(BaseSettings):
     # ── GraphRAG / GDS ────────────────────────────────────────────────────────
     gds_graph_name: str = Field(default="codenexus-graph")
     max_context_tokens: int = Field(
-        default=8000,
-        description="Hard token ceiling for every LLM call (prompt + output reserve).",
+        default=32000,
+        description="Hard token ceiling for every LLM call (prompt + output reserve). "
+                    "gpt-4o-mini supports 128k — set higher for more code context.",
     )
     reflection_max_iterations: int = Field(default=2)
     community_summarization_enabled: bool = Field(default=True)
@@ -307,6 +324,94 @@ class Settings(BaseSettings):
     def get_model_name(self, tier: str = "fast") -> str:
         """Return the model name for the given tier ("fast" or "strong")."""
         return self.llm_strong_model if tier == "strong" else self.llm_fast_model
+
+
+def llm_chat(
+    client,
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int = 2000,
+    on_token=None,          # optional callable(str) — called with each text delta when streaming
+) -> str:
+    """
+    Unified LLM call using the Azure OpenAI Responses API.
+
+    Uses client.responses.create() directly — the correct endpoint for gpt-5
+    and other reasoning models on Azure OpenAI.
+
+    reasoning_effort="low" halves gpt-5 latency by capping internal thinking tokens.
+    Non-reasoning models (gpt-4o-mini) ignore this parameter.
+
+    If on_token is provided, streams the response and calls on_token(delta) for each
+    text chunk as it arrives.  The full assembled text is still returned.
+    """
+    # reasoning_effort is only supported by reasoning/o-series models (gpt-5, o1, o3-mini, etc.)
+    # gpt-4o-mini and gpt-4o reject this parameter with a 400 error.
+    _REASONING_MODELS = ("gpt-5", "o1", "o3", "o4")
+    is_reasoning_model = any(model.startswith(m) for m in _REASONING_MODELS)
+
+    kwargs = dict(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        max_output_tokens=max_tokens,
+    )
+    if is_reasoning_model:
+        kwargs["reasoning"] = {"effort": "low"}
+
+    if on_token is not None:
+        # ── Streaming mode ──────────────────────────────────────────────────
+        kwargs["stream"] = True
+        text_parts: list[str] = []
+        try:
+            with client.responses.create(**kwargs) as stream:
+                for event in stream:
+                    # event.type varies by SDK version
+                    etype = getattr(event, "type", "")
+                    delta = ""
+                    if etype == "response.output_text.delta":
+                        delta = getattr(event, "delta", "") or ""
+                    elif hasattr(event, "delta"):
+                        d = event.delta
+                        delta = d if isinstance(d, str) else getattr(d, "text", "") or ""
+                    if delta:
+                        on_token(delta)
+                        text_parts.append(delta)
+        except TypeError:
+            # Some SDK versions return an iterator, not a context manager
+            for event in client.responses.create(**kwargs):
+                etype = getattr(event, "type", "")
+                delta = ""
+                if etype == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                elif hasattr(event, "delta"):
+                    d = event.delta
+                    delta = d if isinstance(d, str) else getattr(d, "text", "") or ""
+                if delta:
+                    on_token(delta)
+                    text_parts.append(delta)
+        return "".join(text_parts).strip()
+
+    # ── Non-streaming mode ───────────────────────────────────────────────────
+    resp = client.responses.create(**kwargs)
+
+    # Responses API exposes text in several ways depending on SDK version — try all
+    text = getattr(resp, "output_text", None)
+    if not text:
+        output = getattr(resp, "output", None)
+        if output:
+            for item in output:
+                content = getattr(item, "content", None)
+                if content:
+                    for part in content:
+                        t = getattr(part, "text", None)
+                        if t:
+                            text = t
+                            break
+    return (text or "").strip()
 
 
 # Singleton — import this everywhere

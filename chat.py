@@ -150,14 +150,37 @@ def _run_query(question: str, conversation_history: list[dict] | None = None) ->
         primary_targets.append({**node, "source": "graph"})
 
     # Fetch actual source code.
-    # ORDERING: grep context FIRST (most targeted/precise), then node method bodies.
-    # Deduplicate by FILE (not by line) so one snippet per file — prevents OAuthConstants
-    # or AccessTokenIssuer from occupying all 8 slots with multiple hits from the same file.
-    # The "best" line per file: prefer non-import, non-definition, non-test hits.
+    # ORDERING: graph entity method bodies FIRST (most targeted — entity names from LLM parser),
+    # then grep contexts from implementation files (skip constant-definition files like OAuthConstants
+    # and test files — they waste budget and push real implementation code off the screen).
     code_snippets = []
     try:
-        # Pass 1: pick the most interesting grep hit per file, then fetch context
-        from pathlib import Path as _Path
+        # Expand graph seed nodes with sibling methods from the same class
+        graph_seed_fqns = [
+            t["fqn"] for t in primary_targets
+            if t.get("source") == "graph" and t.get("fqn")
+        ]
+        if graph_seed_fqns:
+            try:
+                siblings = router.retriever.get_class_methods(graph_seed_fqns[:8])
+                seen_fqns = {t["fqn"] for t in primary_targets if t.get("fqn")}
+                for sib in siblings:
+                    if sib["fqn"] not in seen_fqns:
+                        primary_targets.append({**sib, "source": "graph"})
+                        seen_fqns.add(sib["fqn"])
+            except Exception as e:
+                logger.debug("Sibling expansion failed: %s", e)
+
+        # Pass 1: graph/semantic nodes — full method bodies (start_line+end_line).
+        fetchable = [t for t in primary_targets if t.get("file_path") and t.get("start_line")]
+        # Graph nodes first, then semantic hits
+        fetchable.sort(key=lambda t: 0 if t.get("source") == "graph" else 1)
+        node_snippets = fetcher.fetch_for_nodes(fetchable[:20])
+        code_snippets.extend(node_snippets)
+
+        # Pass 2: grep contexts — one best hit per file, skip constant-definitions and tests.
+        # Constant-def files (OAuthConstants, ErrorConstants, etc.) are already shown in the
+        # grep_evidence section of the prompt — no need to expand them with ±20 lines of context.
         file_best: dict[str, dict] = {}
         for t in primary_targets:
             if t.get("source") != "grep":
@@ -173,15 +196,14 @@ def _run_query(question: str, conversation_history: list[dict] | None = None) ->
             if fp not in file_best or score > file_best[fp]["score"]:
                 file_best[fp] = {**t, "score": score}
 
-        for fp, t in list(file_best.items())[:10]:
-            snippet = fetcher.fetch_grep_context(fp, t["line_number"], context_lines=10)
+        # Only expand grep context for implementation files (score >= 2).
+        # Tests (score=1) and constant definitions (score=0) are skipped from code snippets.
+        for fp, t in list(file_best.items())[:15]:
+            if t["score"] < 2:
+                continue  # Constant definitions and tests → shown in grep_evidence only
+            snippet = fetcher.fetch_grep_context(fp, t["line_number"], context_lines=20)
             if snippet:
                 code_snippets.append(snippet)
-
-        # Pass 2: graph/semantic nodes with full method bodies (start_line+end_line)
-        fetchable = [t for t in primary_targets if t.get("file_path") and t.get("start_line")]
-        node_snippets = fetcher.fetch_for_nodes(fetchable[:6])
-        code_snippets.extend(node_snippets)
     except Exception as e:
         logger.debug("Code fetch failed: %s", e)
 
@@ -201,6 +223,176 @@ def _run_query(question: str, conversation_history: list[dict] | None = None) ->
         "affected": resp.affected,
         "confidence": resp.confidence,
     }
+
+
+def _run_query_streaming(question: str, conversation_history: list[dict] | None = None) -> dict:
+    """
+    Streaming variant of _run_query.
+
+    Phase 1 (retrieval): router.route() — silent, ~5-15s.
+    Phase 2 (display):   print route header immediately so user sees progress.
+    Phase 3 (generate):  stream answer tokens to terminal as gpt-5 produces them.
+    Returns the same dict as _run_query (answer is the full assembled string).
+    """
+    from reasoning.map_step import MapResult
+    from api.response_builder import build_query_response
+
+    router  = _pipeline["router"]
+    reduce  = _pipeline["reduce"]
+    fetcher = _pipeline["fetcher"]
+
+    effective_question = question
+    if conversation_history:
+        last = conversation_history[-1]
+        ctx = f"[Prior context: {last['q']}]\n{question}"
+        effective_question = ctx
+
+    # ── Phase 1: retrieval (silent) ────────────────────────────────────────
+    print(dim("  Retrieving…"), flush=True)
+    result = router.route(effective_question)
+
+    map_results = []
+    if result.community_summaries:
+        try:
+            map_results = [
+                MapResult(
+                    community_id=s.get("community_id", 0),
+                    summary_text=s.get("summary_text", ""),
+                    score=100,
+                    reason="pre-retrieved",
+                )
+                for s in result.community_summaries
+            ]
+        except Exception:
+            pass
+
+    primary_targets = []
+    for hit in result.grep_hits:
+        if hasattr(hit, "rel_path"):
+            class_name = hit.rel_path.replace("\\", "/").split("/")[-1].replace(".java", "")
+            primary_targets.append({
+                "source": "grep", "fqn": class_name,
+                "file_path": hit.rel_path, "line_number": hit.line_number,
+                "text": hit.line_text, "edge_type": "",
+            })
+    for node in result.seed_nodes:
+        primary_targets.append({**node, "source": "graph"})
+    for node in result.affected_nodes[:10]:
+        primary_targets.append({**node, "source": "graph"})
+
+    code_snippets = []
+    try:
+        # Expand graph seed nodes with sibling methods from the same class.
+        # Without this, finding validateSubjectToken misses validateActorToken,
+        # setSubjectAsAuthorizedUser, etc. which are private helpers with weak embeddings.
+        graph_seed_fqns = [
+            t["fqn"] for t in primary_targets
+            if t.get("source") == "graph" and t.get("fqn")
+        ]
+        if graph_seed_fqns:
+            try:
+                siblings = router.retriever.get_class_methods(graph_seed_fqns[:8])
+                seen_fqns = {t["fqn"] for t in primary_targets if t.get("fqn")}
+                for sib in siblings:
+                    if sib["fqn"] not in seen_fqns:
+                        primary_targets.append({**sib, "source": "graph"})
+                        seen_fqns.add(sib["fqn"])
+            except Exception as e:
+                logger.debug("Sibling expansion failed: %s", e)
+
+        fetchable = [t for t in primary_targets if t.get("file_path") and t.get("start_line")]
+        fetchable.sort(key=lambda t: 0 if t.get("source") == "graph" else 1)
+        node_snippets = fetcher.fetch_for_nodes(fetchable[:20])
+        code_snippets.extend(node_snippets)
+
+        file_best: dict[str, dict] = {}
+        for t in primary_targets:
+            if t.get("source") != "grep":
+                continue
+            fp = t.get("file_path", "")
+            if not fp or not t.get("line_number"):
+                continue
+            txt = t.get("text", "")
+            is_test   = "src/test" in fp or "Test.java" in fp
+            is_import = txt.strip().startswith("import ")
+            is_defn   = "static final" in txt and "=" in txt
+            score = 0 if (is_import or is_defn) else (1 if is_test else 2)
+            if fp not in file_best or score > file_best[fp]["score"]:
+                file_best[fp] = {**t, "score": score}
+
+        for fp, t in list(file_best.items())[:15]:
+            if t["score"] < 2:
+                continue
+            snippet = fetcher.fetch_grep_context(fp, t["line_number"], context_lines=20)
+            if snippet:
+                code_snippets.append(snippet)
+    except Exception as e:
+        logger.debug("Code fetch failed: %s", e)
+
+    # ── Phase 2: show route immediately (user sees this before LLM starts) ──
+    route_col = {
+        "symbolic": "\033[33m", "exact": "\033[36m",
+        "semantic": "\033[35m", "global": "\033[32m",
+    }
+    route_label = result.route.upper()
+    col_code = route_col.get(result.route.split("_")[0], "\033[37m") if USE_COLOR else ""
+    reset = "\033[0m" if USE_COLOR else ""
+    src_count = len(primary_targets)
+    print(f"\n  {bold('Route')}: {col_code}{route_label}{reset}  |  "
+          f"{bold('Sources')}: {src_count}", flush=True)
+    print("  " + "-" * 70, flush=True)
+    print(f"  ", end="", flush=True)   # indent for streamed answer
+
+    # ── Phase 3: stream answer ─────────────────────────────────────────────
+    _first_token = [True]
+
+    def _on_token(delta: str) -> None:
+        # Indent continuation lines to match the leading "  "
+        text = delta.replace("\n", "\n  ")
+        if _first_token[0] and text.startswith("  "):
+            text = text.lstrip()
+        _first_token[0] = False
+        print(text, end="", flush=True)
+
+    answer = reduce.run(
+        map_results=map_results,
+        query=question,
+        primary_targets=primary_targets,
+        code_snippets=code_snippets,
+        route=result.route,
+        on_token=_on_token,
+    )
+    print()  # newline after streamed answer
+
+    resp = build_query_response(result, answer, 0)
+    return {
+        "answer":   answer,
+        "route":    result.route,
+        "sources":  resp.sources,
+        "affected": resp.affected,
+        "confidence": resp.confidence,
+    }
+
+
+def _print_answer_footer(result: dict, latency_ms: float) -> None:
+    """Print just the latency + top sources footer (answer was already streamed)."""
+    print(f"\n  {dim('Latency')}: {latency_ms:.0f}ms", flush=True)
+    sources = result.get("sources", [])
+    if sources:
+        print()
+        print(f"  {dim('Top sources:')}")
+        seen: set[str] = set()
+        for src in sources[:5]:
+            fqn      = getattr(src, "fqn", "") or str(src)
+            rel_path = getattr(src, "rel_path", "") or ""
+            if fqn in seen:
+                continue
+            seen.add(fqn)
+            short_fqn = fqn.split(".")[-1] if "." in fqn else fqn
+            line_no   = getattr(src, "line_number", None)
+            loc       = f"[{rel_path.split('/')[-1]}:{line_no}]" if line_no else f"[{rel_path.split('/')[-1]}]"
+            print(f"    {cyan(short_fqn):<52} {dim(loc)}")
+    print()
 
 
 def _run_explain(fqn: str) -> dict:
@@ -513,13 +705,12 @@ def main() -> None:
 
             # ── Natural-language query ─────────────────────────────────────────
             history.append(line)
-            print(dim("  Thinking…"))
             t0 = time.time()
             try:
-                result = _run_query(line, conversation_history=conversation_history[-3:])
+                result = _run_query_streaming(line, conversation_history=conversation_history[-3:])
                 last_result = result
                 conversation_history.append({"q": line, "a": result["answer"][:300]})
-                _print_answer(result, (time.time() - t0) * 1000)
+                _print_answer_footer(result, (time.time() - t0) * 1000)
             except Exception as e:
                 print(red(f"  Query failed: {e}"))
                 import traceback

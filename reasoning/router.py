@@ -36,12 +36,13 @@ the pre-computed Microsoft GraphRAG Level 3 global summary.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
-from config.settings import settings
+from config.settings import settings, llm_chat
 from reasoning.graph_retriever import GraphRetriever
 from reasoning.lexical_search import LexicalSearcher, GrepHit
 from community.summarizer import COLLECTION_NAME as COMMUNITY_COLLECTION
@@ -55,11 +56,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class QueryClassification:
-    """Output of the pure classifier — no DB I/O, fully unit-testable."""
+    """Output of the classifier — no DB I/O, fully unit-testable."""
     bucket: str          # "symbolic" | "exact" | "conceptual" | "global"
-    confidence: float    # 0.0–1.0 (heuristic)
+    confidence: float    # 0.0–1.0
     symbols: list[str]   # UPPER_SNAKE / quoted literals for grep
     entity_names: list[str]  # CamelCase / FQN candidates
+    clean_query: str = ""    # typo-corrected query for semantic search (LLM parser only)
 
 
 @dataclass
@@ -133,7 +135,10 @@ class QueryClassifier:
             if re.match(r'^[A-Z][A-Z0-9_]{2,}$', name) and '_' in name
         ]
 
-        symbols = list(dict.fromkeys(upper_snake + quoted + extra_snake + compound_snake))
+        # Drop candidates that look like typos (3+ consecutive identical letters, e.g. ACCCORDING)
+        _typo_re = re.compile(r'(.)\1\1')
+        all_symbols = upper_snake + quoted + extra_snake + compound_snake
+        symbols = list(dict.fromkeys(s for s in all_symbols if not _typo_re.search(s)))
 
         if symbols:
             confidence = min(1.0, 0.6 + 0.1 * len(symbols))
@@ -189,7 +194,9 @@ class QueryClassifier:
             "files", "file", "code", "class", "method", "safely", "change",
             "changes", "introduce", "implement", "add", "use", "using",
             "flow", "mandatory", "claim", "request", "response", "grant",
-            "impersonation", "token", "oauth", "enable", "support", "check",
+            "impersonation", "oauth", "enable", "support", "check",
+            # RFC / spec reference noise — "rfc", "according", version numbers etc.
+            "rfc", "according", "specification", "spec", "standard", "based",
             # Generic verbs that produce junk constants (e.g. VALIDATION_HAPPNES)
             "validation", "happens", "happen", "happening", "handles", "handle",
             "performs", "perform", "process", "processes", "execute", "executes",
@@ -210,6 +217,131 @@ class QueryClassifier:
                     snake = "_".join(w.upper() for w in phrase)
                     candidates.add(snake)
         return sorted(candidates, key=len, reverse=True)
+
+
+# ── LLM-based query parser ────────────────────────────────────────────────────
+
+
+class LLMQueryParser:
+    """
+    Replaces the regex-based QueryClassifier with a structured LLM call.
+
+    Advantages over hardcoded heuristics:
+    - Handles typos and synonyms ("acccording" → ignored, "actor tkn" → ActorTokenValidator)
+    - Generates domain-aware Java constant names the regex would miss
+      ("may act" → MAY_ACT, ACTOR_TOKEN_TYPE; "token exchange" → TOKEN_EXCHANGE)
+    - Recognises intent from natural phrasing, not keyword lists
+    - Clean_query fixes typos before semantic vector search runs
+
+    Falls back to QueryClassifier on any LLM error (timeout, quota, etc).
+    Cost: ~0.0001 USD per query (256 output tokens, gpt-4o-mini).
+    Latency: ~1s added to total query time.
+    """
+
+    _SYSTEM = (
+        "You are a search-signal extractor for a Java codebase search engine "
+        "(WSO2 Identity Server — OAuth2 / OIDC / JWT identity platform).\n\n"
+
+        "Given a developer's question, return a JSON object with exactly these fields:\n"
+        "{\n"
+        '  "route": "global" | "symbolic" | "exact" | "conceptual",\n'
+        '  "symbols": [...],\n'
+        '  "entity_names": [...],\n'
+        '  "clean_query": "..."\n'
+        "}\n\n"
+
+        "ROUTE meanings:\n"
+        "  global     — asks for system/architecture overview (big picture, how does the whole system work)\n"
+        "  symbolic   — involves Java constants (UPPER_SNAKE_CASE), string literals, or asks to find/remove a specific value\n"
+        "  exact      — mentions a specific Java class or method name\n"
+        "  conceptual — feature understanding, how-does-X-work, implement-X questions\n\n"
+
+        "symbols — UPPER_SNAKE_CASE constant names AND lowercase string literals to grep for.\n"
+        "  Derive likely names from the question context, even when not explicitly stated.\n"
+        "  Examples:\n"
+        "    'actor token'          → [ACTOR_TOKEN, actor_token, MAY_ACT, ACTOR_TOKEN_TYPE]\n"
+        "    'token exchange flow'  → [TOKEN_EXCHANGE, SUBJECT_TOKEN_TYPE, ACTOR_TOKEN_TYPE]\n"
+        "    'impersonating actor'  → [IMPERSONATING_ACTOR, impersonating_actor]\n"
+        "    'may act claim'        → [MAY_ACT, may_act]\n"
+        "    'subject token'        → [SUBJECT_TOKEN, SUBJECT_TOKEN_TYPE, subject_token]\n\n"
+
+        "entity_names — CamelCase Java class or method names to look up in the graph.\n"
+        "  Derive likely class names even when not explicitly stated.\n"
+        "  Examples:\n"
+        "    'token exchange handler'        → [TokenExchangeGrantHandler]\n"
+        "    'actor token validator'         → [ActorTokenValidator]\n"
+        "    'authorization code grant'      → [AuthorizationCodeGrantHandler]\n"
+        "    'jwt token issuer'              → [JWTTokenIssuer]\n"
+        "    'oauth token validator'         → [OAuth2TokenValidator]\n\n"
+
+        "clean_query — the original question with typos corrected and filler removed.\n"
+        "  Fix spelling silently. Keep technical terms. Remove 'acccording', number-only tokens, etc.\n\n"
+
+        "RULES:\n"
+        "- Never include misspelled words in symbols or entity_names.\n"
+        "- Never include common English words (the, how, what, is, etc.) in any list.\n"
+        "- Return empty lists [] when nothing applies.\n"
+        "- Output ONLY a valid JSON object. No explanation, no markdown, no extra text."
+    )
+
+    def __init__(self):
+        self._llm = settings.make_llm_client()
+        if settings.llm_provider.lower() == "azure":
+            self._model = (
+                settings.llm_parser_deployment
+                or settings.llm_deployment
+                or settings.llm_model
+            )
+        else:
+            self._model = settings.llm_parser_model or settings.llm_model
+
+    def parse(self, question: str) -> QueryClassification:
+        """
+        Call LLM to extract search signals from the question.
+        Returns QueryClassification. Falls back to regex on any error.
+        """
+        try:
+            raw = llm_chat(
+                self._llm, self._model,
+                system=self._SYSTEM,
+                user=question,
+                max_tokens=1000,
+            )
+            logger.debug("LLM parser raw response (model=%s, len=%d): %r", self._model, len(raw), raw[:200])
+
+            if not raw:
+                raise ValueError(f"Model {self._model!r} returned empty content. "
+                                 "Check deployment name and Azure quota.")
+
+            # Model may wrap JSON in markdown fences — strip them
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw.strip())
+            # Find the JSON object (handles extra prose before/after)
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            raw = match.group(0) if match else raw
+            data = json.loads(raw)
+
+            route        = data.get("route", "conceptual")
+            symbols      = [s for s in data.get("symbols", []) if isinstance(s, str) and s.strip()]
+            entity_names = [e for e in data.get("entity_names", []) if isinstance(e, str) and e.strip()]
+            clean_query  = data.get("clean_query", question) or question
+
+            # Sanity-guard: drop anything with 3+ repeated letters (model hallucination / typo)
+            _typo_re = re.compile(r'(.)\1\1')
+            symbols      = [s for s in symbols      if not _typo_re.search(s)]
+            entity_names = [e for e in entity_names if not _typo_re.search(e)]
+
+            confidence = 0.9 if (symbols or entity_names) else 0.55
+            logger.info(
+                "LLM parser: route=%s symbols=%s entities=%s",
+                route, symbols[:4], entity_names[:4],
+            )
+            return QueryClassification(route, confidence, symbols, entity_names, clean_query)
+
+        except Exception as e:
+            logger.error("LLM query parser failed (model=%s) — falling back to regex: %s", self._model, e)
+            return QueryClassifier().classify(question)
 
 
 # ── Router (DB-backed orchestration) ─────────────────────────────────────────
@@ -233,7 +365,8 @@ class QueryRouter:
         )
         self.retriever  = GraphRetriever(chroma_client=chroma_client)
         self.lexical    = LexicalSearcher()
-        self.classifier = QueryClassifier()
+        self.llm_parser = LLMQueryParser()   # primary: LLM-based extraction
+        self.classifier = QueryClassifier()  # fallback: regex-based extraction
         self.global_rollup = GlobalRollup(chroma_client)
 
     def _reconnect_chroma(self):
@@ -262,8 +395,10 @@ class QueryRouter:
                 raise
 
     def route(self, question: str) -> RouterResult:
-        """Classify → retrieve ALL evidence paths in parallel → merge → return."""
-        classification = self.classifier.classify(question)
+        """LLM-parse → classify → retrieve ALL evidence paths in parallel → merge → return."""
+        # Primary: LLM extracts symbols, class names, and fixes typos in one fast call.
+        # Fallback inside LLMQueryParser if the LLM call fails.
+        classification = self.llm_parser.parse(question)
         logger.info(
             "Query classified  bucket=%s  confidence=%.2f  symbols=%s  entities=%s",
             classification.bucket,
@@ -276,8 +411,11 @@ class QueryRouter:
         if classification.bucket == "global":
             return self._global_route(question)
 
+        # Use the LLM-corrected query for semantic search (fixes typos like "acccording")
+        effective_query = classification.clean_query or question
+
         # All other routes: run every applicable evidence path in parallel, then merge.
-        return self._multi_route(question, classification)
+        return self._multi_route(effective_query, classification)
 
     def close(self):
         self.retriever.close()

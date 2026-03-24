@@ -40,20 +40,28 @@ class _LUStub:
     start_line: int
     end_line: int
     repo_name: str
+    body_text: str = ""      # actual source code body stored on the node
+    docstring: str = ""      # Javadoc if present
 
 
 def _build_intent_text(lu: _LUStub) -> str:
     """
-    Build a synthetic intent string from Neo4j node properties.
-    Mirrors _synthesize_intent() in vectorstore/chunker.py but works
-    from raw property dicts (no UIR LogicUnit object available here).
+    Build a rich intent string for semantic search.
+
+    Priority:
+      1. docstring  — if Javadoc was extracted, use it (most descriptive)
+      2. body_text  — actual source code; embedder understands code structure
+      3. fqn only   — last resort (original behaviour, very weak)
+
+    The [Package:] [Class:] prefix is always included so the vector
+    carries class-level context alongside the method signal.
     """
     fqn = lu.fqn or ""
-    # Extract class and package prefix
     base = fqn.split("(")[0] if "(" in fqn else fqn
     parts = base.split(".")
-    class_name = parts[-2] if len(parts) >= 2 else ""
+    class_name   = parts[-2] if len(parts) >= 2 else ""
     package_name = ".".join(parts[:-2]) if len(parts) >= 3 else ""
+    method_name  = fqn.split("(")[0].rsplit(".", 1)[-1] if fqn else "unknown"
 
     prefix = ""
     if package_name:
@@ -61,11 +69,16 @@ def _build_intent_text(lu: _LUStub) -> str:
     elif class_name:
         prefix = f"[Class: {class_name}] "
 
-    # Method name from FQN (strip params and class prefix)
-    method_part = fqn.split("(")[0].rsplit(".", 1)[-1] if fqn else "unknown"
-    # Params are not available from Neo4j — use bare method name
-    intent = f"{method_part}()"
-    return prefix + intent
+    if lu.docstring and lu.docstring.strip():
+        return f"{prefix}{method_name}: {lu.docstring.strip()}"
+
+    if lu.body_text and lu.body_text.strip():
+        # Truncate body to 1 000 chars — enough for semantic signal, not too large
+        body = lu.body_text.strip()[:1000]
+        return f"{prefix}{method_name}:\n{body}"
+
+    # Fallback: bare method name (original behaviour)
+    return f"{prefix}{method_name}()"
 
 
 def run(dry_run: bool = False, batch_size: int = 500):
@@ -86,12 +99,14 @@ def run(dry_run: bool = False, batch_size: int = 500):
         rows = list(s.run(
             """
             MATCH (n:LogicUnit)
-            RETURN n.geid      AS geid,
-                   n.fqn       AS fqn,
-                   n.file_path AS file_path,
+            RETURN n.geid       AS geid,
+                   n.fqn        AS fqn,
+                   n.file_path  AS file_path,
                    n.start_line AS start_line,
                    n.end_line   AS end_line,
-                   n.repo_name  AS repo_name
+                   n.repo_name  AS repo_name,
+                   n.body_text  AS body_text,
+                   n.docstring  AS docstring
             """
         ))
     all_stubs = {
@@ -102,6 +117,8 @@ def run(dry_run: bool = False, batch_size: int = 500):
             start_line=r["start_line"] or 0,
             end_line=r["end_line"] or 0,
             repo_name=r["repo_name"] or "",
+            body_text=r["body_text"] or "",
+            docstring=r["docstring"] or "",
         )
         for r in rows
         if r["geid"]
