@@ -337,7 +337,7 @@ def _run_query_streaming(question: str, conversation_history: list[dict] | None 
     route_label = result.route.upper()
     col_code = route_col.get(result.route.split("_")[0], "\033[37m") if USE_COLOR else ""
     reset = "\033[0m" if USE_COLOR else ""
-    src_count = len(primary_targets)
+    src_count = len(primary_targets) + len(map_results)
     print(f"\n  {bold('Route')}: {col_code}{route_label}{reset}  |  "
           f"{bold('Sources')}: {src_count}", flush=True)
     print("  " + "-" * 70, flush=True)

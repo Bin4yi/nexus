@@ -251,10 +251,12 @@ class LLMQueryParser:
         "}\n\n"
 
         "ROUTE meanings:\n"
-        "  global     — asks for system/architecture overview (big picture, how does the whole system work)\n"
+        "  global     — asks for true system/architecture overview ONLY: 'big picture', 'how does the whole system work', 'describe the architecture'\n"
+        "               Do NOT use global for questions about specific features, communities, or topics.\n"
         "  symbolic   — involves Java constants (UPPER_SNAKE_CASE), string literals, or asks to find/remove a specific value\n"
         "  exact      — mentions a specific Java class or method name\n"
-        "  conceptual — feature understanding, how-does-X-work, implement-X questions\n\n"
+        "  conceptual — feature understanding, how-does-X-work, implement-X questions, OR questions about which communities/components handle a specific topic\n\n"
+        "IMPORTANT: Questions like 'which communities handle token validation' or 'which components are responsible for X' are CONCEPTUAL, not global.\n\n"
 
         "symbols — UPPER_SNAKE_CASE constant names AND lowercase string literals to grep for.\n"
         "  Derive likely names from the question context, even when not explicitly stated.\n"
