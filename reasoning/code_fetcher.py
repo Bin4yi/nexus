@@ -47,6 +47,10 @@ class CodeFetcher:
         Fetch a complete method/class body from a Neo4j LogicUnit node dict.
         Node must have: file_path, fqn, start_line, end_line.
 
+        Automatically includes annotation lines immediately above the method
+        (e.g. @Path("/oauth2"), @Reference, @Override) so the LLM sees the
+        full declaration context without needing docstrings stored in Neo4j.
+
         Args:
             node:          Neo4j node dict with file_path and line range
             context_lines: Extra lines of context to include before/after
@@ -57,7 +61,8 @@ class CodeFetcher:
         e   = node.get("end_line")
         if not fp or s is None or e is None:
             return None
-        return self._read_range(fp, fqn, int(s), int(e), context_lines)
+        return self._read_range(fp, fqn, int(s), int(e), context_lines,
+                                include_annotations=True)
 
     def fetch_for_nodes(self, nodes: list[dict], context_lines: int = 0) -> list:
         """
@@ -97,10 +102,59 @@ class CodeFetcher:
 
     # ── Private ───────────────────────────────────────────────────────────────
 
+    def fetch_table_schema(self, table_name: str, source_file: str) -> CodeSnippet | None:
+        """
+        Read a CREATE TABLE DDL block from a SQL file for the given table name.
+        Returns a CodeSnippet whose .code contains the DDL, or None if not found.
+        """
+        abs_path = self._resolve(source_file)
+        if abs_path is None:
+            return None
+        try:
+            all_lines = abs_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception as e:
+            logger.warning("Could not read SQL file %s: %s", abs_path, e)
+            return None
+
+        # Find the CREATE TABLE line (case-insensitive, table name match)
+        start_idx = None
+        for i, line in enumerate(all_lines):
+            upper = line.upper()
+            if "CREATE TABLE" in upper and table_name.upper() in upper:
+                start_idx = i
+                break
+        if start_idx is None:
+            return None
+
+        # Read until the closing ')' of the CREATE TABLE block
+        end_idx = start_idx
+        depth = 0
+        for i in range(start_idx, min(start_idx + 200, len(all_lines))):
+            depth += all_lines[i].count("(") - all_lines[i].count(")")
+            end_idx = i
+            if depth <= 0 and i > start_idx:
+                break
+
+        numbered = "\n".join(
+            f"{start_idx + j + 1:4d} │ {line}"
+            for j, line in enumerate(all_lines[start_idx:end_idx + 1])
+        )
+        rel = str(abs_path.relative_to(MIRROR_ROOT)).replace("\\", "/")
+        return CodeSnippet(
+            fqn=f"TABLE:{table_name}",
+            file_path=rel,
+            start_line=start_idx + 1,
+            end_line=end_idx + 1,
+            language="sql",
+            code=numbered,
+            context_note=f"CREATE TABLE {table_name} schema",
+        )
+
     def _read_range(self, file_path: str, fqn: str,
                     start: int, end: int,
                     context_lines: int = 0,
-                    context_note: str = "") -> CodeSnippet | None:
+                    context_note: str = "",
+                    include_annotations: bool = False) -> CodeSnippet | None:
         """Read lines [start, end] (1-indexed) from the file."""
         abs_path = self._resolve(file_path)
         if abs_path is None:
@@ -113,8 +167,26 @@ class CodeFetcher:
             return None
 
         s = max(0, start - 1 - context_lines)
-        e = min(len(all_lines), end + context_lines)
-        snippet_lines = all_lines[s:e]
+        e_idx = min(len(all_lines), end + context_lines)
+
+        # Scan up to 6 lines above the method start for annotation lines
+        # e.g. @Path("/oauth2"), @Reference, @Override, @Transactional
+        if include_annotations and s > 0:
+            method_start_0 = start - 1  # 0-indexed position of the method's first line
+            scan_top = max(0, method_start_0 - 6)
+            ann_top = method_start_0
+            for i in range(method_start_0 - 1, scan_top - 1, -1):
+                stripped = all_lines[i].strip()
+                if stripped.startswith("@"):
+                    ann_top = i   # include this annotation line
+                elif stripped == "":
+                    continue      # skip blank lines while scanning
+                else:
+                    break         # hit a non-annotation, non-blank line — stop
+            # Only extend upward if we actually found annotations above context_lines
+            s = min(s, ann_top)
+
+        snippet_lines = all_lines[s:e_idx]
 
         # Prepend line numbers for readability
         numbered = "\n".join(

@@ -1,0 +1,45 @@
+# ── Git history ───────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── Cloned repo mirrors (mounted as a volume at runtime instead) ───────────────
+mirror/
+
+# ── Python virtual environment (rebuilt inside the container) ─────────────────
+Lib/
+lib/
+bin/
+include/
+Scripts/
+pyvenv.cfg
+*.egg-info/
+dist/
+build/
+
+# ── Byte-compiled files ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Dev / test artefacts ───────────────────────────────────────────────────────
+.env
+.env.*
+tests/
+test_*.py
+*_test.py
+
+# ── Generated outputs ──────────────────────────────────────────────────────────
+*.svg
+*.dot
+graph_*.html
+
+# ── Documentation ─────────────────────────────────────────────────────────────
+docs/
+*.md
+
+# ── IDE and OS noise ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db

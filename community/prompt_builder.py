@@ -68,11 +68,7 @@ def build_community_prompt(
         for node in class_nodes:
             fqn = node.get("fqn", "")
             kind = node.get("kind", "class")
-            doc = node.get("docstring", "").strip()
             line = f"- [{kind}] {fqn}"
-            if doc:
-                doc_short = doc[:250] + "..." if len(doc) > 250 else doc
-                line += f"\n  Doc: {doc_short}"
             node_lines.append(line)
         node_lines.append("")
 
@@ -82,11 +78,7 @@ def build_community_prompt(
         for node in method_nodes:
             fqn = node.get("fqn", "")
             kind = node.get("kind", "")
-            doc = node.get("docstring", "").strip()
             line = f"- [{kind}] {fqn}"
-            if doc:
-                doc_short = doc[:200] + "..." if len(doc) > 200 else doc
-                line += f"\n  Doc: {doc_short}"
             node_lines.append(line)
 
     # Boundary edges — how this community connects to others

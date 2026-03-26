@@ -238,7 +238,7 @@ class GraphRetriever:
                         WHERE score > 0
                         RETURN node.geid     AS geid,
                                node.fqn      AS fqn,
-                               node.docstring AS text,
+                               node.fqn AS text,
                                score
                         ORDER BY score DESC
                         LIMIT $n
@@ -309,7 +309,7 @@ class GraphRetriever:
 
     @_neo4j_retry
     def _find_in_graph(self, entity_name: str) -> list[dict]:
-        """Direct Neo4j node lookup by FQN, name, or docstring reference."""
+        """Direct Neo4j node lookup by FQN or name."""
         with self._driver.session() as session:
             result = session.run(
                 """
@@ -319,7 +319,6 @@ class GraphRetriever:
                     n.fqn       CONTAINS $name
                     OR n.name    = $name
                     OR n.fqn    ENDS WITH ('.' + $name)
-                    OR (n.docstring IS NOT NULL AND n.docstring CONTAINS $name)
                   )
                 RETURN
                     n.fqn          AS fqn,
@@ -713,9 +712,8 @@ class GraphRetriever:
             result = session.run(
                 """
                 MATCH (n:LogicUnit)
-                WHERE (n.docstring IS NOT NULL AND n.docstring CONTAINS $exc)
-                   OR (n.fqn CONTAINS $exc)
-                   AND (n.file_path CONTAINS 'src/main/java' OR n.file_path CONTAINS 'src\\main\\java')
+                WHERE (n.fqn CONTAINS $exc)
+                  AND (n.file_path CONTAINS 'src/main/java' OR n.file_path CONTAINS 'src\\main\\java')
                 RETURN
                     n.fqn          AS fqn,
                     n.file_path    AS file_path,
@@ -918,6 +916,35 @@ class GraphRetriever:
             )
             rows = [dict(r) for r in result]
         logger.info("find_nodes_by_fqns: %d fqns → %d nodes", len(fqns), len(rows))
+        return rows
+
+    @_neo4j_retry
+    def get_datasink_tables(self, fqns: list[str]) -> list[dict]:
+        """
+        For a list of Component FQNs, return any DatabaseTable nodes they
+        reach via [:QUERIES_TABLE] edges (i.e. DAO / repository classes).
+
+        Each row: {component_fqn, table_name, source_file, repo_name}
+        Used to inject CREATE TABLE DDL into the LLM context when the query
+        touches data-persistence code.
+        """
+        if not fqns:
+            return []
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (c:Component)-[:QUERIES_TABLE]->(t:DatabaseTable)
+                WHERE c.fqn IN $fqns
+                RETURN c.fqn       AS component_fqn,
+                       t.name       AS table_name,
+                       t.source_file AS source_file,
+                       t.repo_name  AS repo_name
+                ORDER BY t.name
+                """,
+                fqns=fqns,
+            )
+            rows = [dict(r) for r in result]
+        logger.info("get_datasink_tables: %d fqns → %d tables", len(fqns), len(rows))
         return rows
 
     # ── Private ───────────────────────────────────────────────────────────────

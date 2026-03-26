@@ -26,3 +26,4 @@ class CommunitySummary(BaseModel):
     generated_at: datetime = Field(default_factory=datetime.utcnow)
     token_count: int = 0                # prompt token count — checked against 8k limit
     prompt_truncated: bool = False      # True if community nodes were truncated to fit budget
+    fqn_hash: str = ""                  # SHA-1[:16] of sorted FQN list — used for incremental skip

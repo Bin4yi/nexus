@@ -4,13 +4,13 @@ Backfills code_intent vectors for all LogicUnit nodes that currently
 lack them in ChromaDB (i.e. methods with no Javadoc).
 
 Run from nexus/ with:
-    py backfill_method_intent.py [--dry-run] [--batch 500]
+    py tools/backfill_method_intent.py [--dry-run] [--batch 500]
 
 What it does:
   1. Queries Neo4j for ALL LogicUnit GEIDs + their metadata.
   2. Queries ChromaDB code_intent for GEIDs that already have vectors.
-  3. For each missing GEID, reconstructs a _synthesize_intent string
-     from the node's Neo4j properties (fqn, file_path, start/end line).
+  3. For each missing GEID, reads actual source code from disk via CodeFetcher
+     (file_path + start_line/end_line from Neo4j node).
   4. Upserts the new code_intent chunks into ChromaDB.
 
 Expected result for the current graph:
@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,18 +40,14 @@ class _LUStub:
     start_line: int
     end_line: int
     repo_name: str
-    body_text: str = ""      # actual source code body stored on the node
-    docstring: str = ""      # Javadoc if present
 
 
-def _build_intent_text(lu: _LUStub) -> str:
+def _build_intent_text(lu: _LUStub, fetcher) -> str:
     """
     Build a rich intent string for semantic search.
 
-    Priority:
-      1. docstring  — if Javadoc was extracted, use it (most descriptive)
-      2. body_text  — actual source code; embedder understands code structure
-      3. fqn only   — last resort (original behaviour, very weak)
+    Reads actual source code from disk via CodeFetcher.
+    Falls back to bare FQN if file is unavailable.
 
     The [Package:] [Class:] prefix is always included so the vector
     carries class-level context alongside the method signal.
@@ -69,15 +65,18 @@ def _build_intent_text(lu: _LUStub) -> str:
     elif class_name:
         prefix = f"[Class: {class_name}] "
 
-    if lu.docstring and lu.docstring.strip():
-        return f"{prefix}{method_name}: {lu.docstring.strip()}"
-
-    if lu.body_text and lu.body_text.strip():
-        # Truncate body to 1 000 chars — enough for semantic signal, not too large
-        body = lu.body_text.strip()[:1000]
+    # Read source code from disk
+    snippet = fetcher.fetch_method({
+        "file_path": lu.file_path,
+        "fqn": lu.fqn,
+        "start_line": lu.start_line,
+        "end_line": lu.end_line,
+    })
+    if snippet and snippet.code.strip():
+        body = snippet.code.strip()[:1000]
         return f"{prefix}{method_name}:\n{body}"
 
-    # Fallback: bare method name (original behaviour)
+    # Fallback: bare method name
     return f"{prefix}{method_name}()"
 
 
@@ -87,11 +86,13 @@ def run(dry_run: bool = False, batch_size: int = 500):
     from config.settings import settings
     from vectorstore.embedder import ChromaEmbedder
     from vectorstore.chunker import EmbeddingChunk
+    from reasoning.code_fetcher import CodeFetcher
 
     logger.info("Connecting to Neo4j and ChromaDB…")
     driver = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
     chroma = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
     embedder = ChromaEmbedder(chroma)
+    fetcher = CodeFetcher()
 
     # ── Step 1: fetch all LogicUnit stubs from Neo4j ────────────────────────
     logger.info("Fetching all LogicUnit nodes from Neo4j…")
@@ -104,9 +105,7 @@ def run(dry_run: bool = False, batch_size: int = 500):
                    n.file_path  AS file_path,
                    n.start_line AS start_line,
                    n.end_line   AS end_line,
-                   n.repo_name  AS repo_name,
-                   n.body_text  AS body_text,
-                   n.docstring  AS docstring
+                   n.repo_name  AS repo_name
             """
         ))
     all_stubs = {
@@ -117,8 +116,6 @@ def run(dry_run: bool = False, batch_size: int = 500):
             start_line=r["start_line"] or 0,
             end_line=r["end_line"] or 0,
             repo_name=r["repo_name"] or "",
-            body_text=r["body_text"] or "",
-            docstring=r["docstring"] or "",
         )
         for r in rows
         if r["geid"]
@@ -184,7 +181,7 @@ def run(dry_run: bool = False, batch_size: int = 500):
         batch_stubs = missing_list[i : i + batch_size]
         chunks = []
         for lu in batch_stubs:
-            text = _build_intent_text(lu)
+            text = _build_intent_text(lu, fetcher)
             if not text.strip():
                 continue
             chunks.append(EmbeddingChunk(

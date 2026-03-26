@@ -11,6 +11,7 @@ All heavy imports (chromadb, openai) are deferred into __init__ to avoid
 pydantic-v1 shim crash on Python 3.14 at module collection time.
 """
 from __future__ import annotations
+import hashlib
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -54,21 +55,82 @@ class CommunitySummarizer:
         self.llm = llm_client or settings.make_llm_client()
         self.collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
 
+    @staticmethod
+    def _community_hash(fqn_list: list[str]) -> str:
+        """
+        Stable SHA-1 hash of the sorted FQN list for a community.
+        If two successive ingestion runs produce the same hash, the community
+        structure has not changed — skip the LLM call entirely.
+        Cost: O(N * len(fqn)) in CPU, zero network/API calls.
+        """
+        digest = hashlib.sha1(
+            "\n".join(sorted(fqn_list)).encode("utf-8")
+        ).hexdigest()[:16]
+        return digest
+
+    def _load_existing_hashes(self) -> dict[int, str]:
+        """
+        Return {community_id: fqn_hash} for all summaries already in ChromaDB.
+        If the collection is empty or the metadata lacks 'fqn_hash', returns {}.
+        """
+        existing: dict[int, str] = {}
+        try:
+            count = self.collection.count()
+            if count == 0:
+                return existing
+            batch = self.collection.get(
+                limit=count,
+                include=["metadatas"],
+            )
+            for meta in batch.get("metadatas") or []:
+                cid  = meta.get("community_id")
+                h    = meta.get("fqn_hash", "")
+                if cid is not None and h:
+                    existing[int(cid)] = h
+        except Exception as e:
+            logger.warning("Could not load existing community hashes: %s", e)
+        return existing
+
     def summarize_all(self) -> list[CommunitySummary]:
         """
         Summarize all communities in the graph.
-        Idempotent — existing summaries are overwritten (upsert).
+
+        Incremental — communities whose FQN set is unchanged (same hash) are
+        skipped, so re-running after adding one repo only re-summarizes the
+        affected communities.  LLM cost is proportional to change, not total
+        graph size.
 
         Uses ``ThreadPoolExecutor`` with ``settings.summarizer_max_workers``
         concurrent workers to parallelise LLM calls.
 
         Returns:
-            List of all generated CommunitySummary objects
+            List of newly generated CommunitySummary objects (skipped ones omitted).
         """
         community_ids = self.gds_client.list_community_ids()
+        existing_hashes = self._load_existing_hashes()
+
+        # Pre-fetch FQN lists to compute hashes (cheap Neo4j reads, no LLM).
+        # Cache node lists so summarize_community() can reuse them without
+        # a second round-trip to Neo4j.
+        to_summarize: list[int] = []
+        _node_cache: dict[int, list[dict]] = {}
+        skipped = 0
+        for cid in community_ids:
+            nodes = self.gds_client.get_nodes_by_community(cid)
+            fqn_list = [n["fqn"] for n in nodes if n.get("fqn")]
+            new_hash = self._community_hash(fqn_list)
+            if existing_hashes.get(cid) == new_hash:
+                skipped += 1
+            else:
+                _node_cache[cid] = nodes
+                to_summarize.append(cid)
+
+        self._node_cache = _node_cache  # thread-safe read (written before pool starts)
+
         logger.info(
-            "Summarizing %d communities (max_workers=%d)...",
-            len(community_ids),
+            "Communities: %d total, %d unchanged (skipping), %d to re-summarize "
+            "(max_workers=%d)…",
+            len(community_ids), skipped, len(to_summarize),
             settings.summarizer_max_workers,
         )
 
@@ -78,7 +140,7 @@ class CommunitySummarizer:
         with ThreadPoolExecutor(max_workers=settings.summarizer_max_workers) as executor:
             future_to_cid = {
                 executor.submit(self.summarize_community, cid): cid
-                for cid in community_ids
+                for cid in to_summarize
             }
             for future in as_completed(future_to_cid):
                 cid = future_to_cid[future]
@@ -89,8 +151,8 @@ class CommunitySummarizer:
                     logger.error("Failed to summarize community %d: %s", cid, e)
 
         logger.info(
-            "Generated %d community summaries (%d failed)",
-            len(summaries), failed,
+            "Done. New/updated: %d, skipped: %d, failed: %d",
+            len(summaries), skipped, failed,
         )
         return summaries
 
@@ -104,9 +166,13 @@ class CommunitySummarizer:
         Returns:
             CommunitySummary with LLM output and token count
         """
-        nodes = self.gds_client.get_nodes_by_community(community_id)
+        # Use pre-fetched nodes from summarize_all() cache if available,
+        # otherwise fetch directly (supports calling summarize_community() standalone).
+        cache = getattr(self, "_node_cache", {})
+        nodes = cache.get(community_id) or self.gds_client.get_nodes_by_community(community_id)
         boundary_edges = self.gds_client.get_community_boundary_edges(community_id)
         fqn_list = [n["fqn"] for n in nodes if n.get("fqn")]
+        fqn_hash = self._community_hash(fqn_list)
 
         # Build prompt (token-budget-enforced, includes class-level context + boundary edges)
         prompt, truncated = build_community_prompt(
@@ -146,6 +212,7 @@ class CommunitySummarizer:
             llm_model=settings.llm_model,
             token_count=token_count,
             prompt_truncated=truncated,
+            fqn_hash=fqn_hash,
         )
 
         # Upsert into ChromaDB
@@ -168,6 +235,7 @@ class CommunitySummarizer:
                 "token_count": summary.token_count,
                 "prompt_truncated": str(summary.prompt_truncated),
                 "generated_at": summary.generated_at.isoformat(),
+                "fqn_hash": summary.fqn_hash,
             }],
         )
         logger.debug("Upserted community %d summary to ChromaDB", summary.community_id)

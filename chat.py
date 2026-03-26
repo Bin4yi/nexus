@@ -171,6 +171,42 @@ def _run_query(question: str, conversation_history: list[dict] | None = None) ->
             except Exception as e:
                 logger.debug("Sibling expansion failed: %s", e)
 
+            # ── Feature 1: Multi-hop neighbor expansion ──────────────────────
+            # For each top seed node, add direct callers and callees so the LLM
+            # sees WHERE each method is called from and WHAT it calls.
+            # This is the core value of having Neo4j — zero extra RAM cost.
+            try:
+                seen_fqns = {t["fqn"] for t in primary_targets if t.get("fqn")}
+                for fqn in graph_seed_fqns[:5]:
+                    for neighbor in (
+                        router.retriever.get_callers(fqn)[:5]
+                        + router.retriever.get_callees(fqn)[:5]
+                    ):
+                        nfqn = neighbor.get("fqn")
+                        if nfqn and nfqn not in seen_fqns:
+                            primary_targets.append({**neighbor, "source": "graph"})
+                            seen_fqns.add(nfqn)
+            except Exception as e:
+                logger.debug("Neighbor expansion failed: %s", e)
+
+        # ── Feature 8: DataSink schema injection ─────────────────────────────
+        # If any retrieved Component is a DAO/repository class, fetch the
+        # CREATE TABLE DDL for the tables it queries and inject into code_snippets.
+        try:
+            all_fqns = [t["fqn"] for t in primary_targets if t.get("fqn")]
+            table_rows = router.retriever.get_datasink_tables(all_fqns)
+            seen_tables: set[str] = set()
+            for row in table_rows:
+                tname = row.get("table_name", "")
+                src   = row.get("source_file", "")
+                if tname and src and tname not in seen_tables:
+                    schema_snippet = fetcher.fetch_table_schema(tname, src)
+                    if schema_snippet:
+                        code_snippets.append(schema_snippet)
+                        seen_tables.add(tname)
+        except Exception as e:
+            logger.debug("DataSink schema injection failed: %s", e)
+
         # Pass 1: graph/semantic nodes — full method bodies (start_line+end_line).
         fetchable = [t for t in primary_targets if t.get("file_path") and t.get("start_line")]
         # Graph nodes first, then semantic hits
@@ -299,6 +335,37 @@ def _run_query_streaming(question: str, conversation_history: list[dict] | None 
                         seen_fqns.add(sib["fqn"])
             except Exception as e:
                 logger.debug("Sibling expansion failed: %s", e)
+
+            # ── Feature 1: Multi-hop neighbor expansion ──────────────────────
+            try:
+                seen_fqns = {t["fqn"] for t in primary_targets if t.get("fqn")}
+                for fqn in graph_seed_fqns[:5]:
+                    for neighbor in (
+                        router.retriever.get_callers(fqn)[:5]
+                        + router.retriever.get_callees(fqn)[:5]
+                    ):
+                        nfqn = neighbor.get("fqn")
+                        if nfqn and nfqn not in seen_fqns:
+                            primary_targets.append({**neighbor, "source": "graph"})
+                            seen_fqns.add(nfqn)
+            except Exception as e:
+                logger.debug("Neighbor expansion failed: %s", e)
+
+        # ── Feature 8: DataSink schema injection ─────────────────────────────
+        try:
+            all_fqns = [t["fqn"] for t in primary_targets if t.get("fqn")]
+            table_rows = router.retriever.get_datasink_tables(all_fqns)
+            seen_tables: set[str] = set()
+            for row in table_rows:
+                tname = row.get("table_name", "")
+                src   = row.get("source_file", "")
+                if tname and src and tname not in seen_tables:
+                    schema_snippet = fetcher.fetch_table_schema(tname, src)
+                    if schema_snippet:
+                        code_snippets.append(schema_snippet)
+                        seen_tables.add(tname)
+        except Exception as e:
+            logger.debug("DataSink schema injection failed: %s", e)
 
         fetchable = [t for t in primary_targets if t.get("file_path") and t.get("start_line")]
         fetchable.sort(key=lambda t: 0 if t.get("source") == "graph" else 1)

@@ -71,6 +71,12 @@ services:
       CHROMA_PORT: "8000"
       REDIS_URL: redis://redis:6379/0
       API_KEYS: ""          # set a real key in production
+      REPOS_MIRROR_PATH: /app/mirror   # code_fetcher.py reads source from here
+    volumes:
+      # Mirror is NOT baked into the image — it's bind-mounted from the host.
+      # This keeps the image small and ensures the container always sees the
+      # latest cloned source without a rebuild.
+      - ./mirror:/app/mirror:ro
     depends_on:
       neo4j:
         condition: service_healthy

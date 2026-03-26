@@ -63,14 +63,14 @@ INDEXES = [
 FULLTEXT_INDEX = """
 CREATE FULLTEXT INDEX code_search IF NOT EXISTS
 FOR (n:LogicUnit|Component)
-ON EACH [n.fqn, n.docstring]
+ON EACH [n.fqn]
 """
 
 # Extended fulltext index covering short name for BM25 hybrid search
 FULLTEXT_INDEX_NAMES = """
 CREATE FULLTEXT INDEX code_search_names IF NOT EXISTS
 FOR (n:LogicUnit|Component)
-ON EACH [n.name, n.fqn, n.docstring]
+ON EACH [n.name, n.fqn]
 """
 
 

@@ -152,7 +152,7 @@ class GDSClient:
                 MATCH (n {community_id: $cid})
                 WHERE n:LogicUnit OR n:Component
                 RETURN n.geid AS geid, n.fqn AS fqn,
-                       n.docstring AS docstring, n.kind AS kind,
+                       null AS docstring, n.kind AS kind,
                        n.file_path AS file_path,
                        labels(n)[0] AS label
                 ORDER BY label DESC, n.fqn

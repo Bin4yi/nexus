@@ -207,16 +207,12 @@ class FlowNarrativeSummarizer:
             kind = detail.get("kind", "")
             labels = detail.get("labels", [])
             label_str = ", ".join(labels) if labels else ""
-            doc = (detail.get("docstring") or "")[:200]
-
             step = f"{i+1}. `{fqn}`"
             if kind:
                 step += f" [{kind}]"
             if label_str:
                 step += f" ({label_str})"
             lines.append(step)
-            if doc:
-                lines.append(f"   Doc: {doc}")
 
         # Configuration keys
         if flow.config_keys:
