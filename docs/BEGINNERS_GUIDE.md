@@ -606,6 +606,8 @@ previous regex-based parser would miss or mislabel nested sections.
 | `graph/cleanup.py` | **Incremental cleanup.** Removes stale nodes when a file changes. Does NOT wipe the whole database. |
 | `graph/tagger.py` | **EntryPoint/DataSink Tagger.** Labels API endpoints as `:EntryPoint` and DAO/Repository classes as `:DataSink` for flow extraction. |
 | `graph/flow_extractor.py` | **GDS Dijkstra Flow Extractor (Sprint 3).** Finds shortest execution paths from each `:EntryPoint` to each `:DataSink` using weighted GDS Dijkstra. CALLS=1, REMOTE_CALLS=5 (cross-service penalty). Returns `FlowPath` objects enriched with config keys and table names. |
+| `graph/sqlite_exporter.py` | **Neo4j → SQLite Exporter.** Runs automatically at the end of every ingest. Exports nodes, CALLS edges, property edges, and DataSink table edges into `data/nexus_graph.db`. Also builds an FTS5 full-text index for keyword search. Can be run standalone in ~5 seconds without re-ingesting. |
+| `graph/sqlite_retriever.py` | **Live API graph retriever.** Drop-in replacement for the old Neo4j retriever. Loads all CALLS edges into memory at startup for O(1) BFS blast-radius computation. All graph queries (node lookup, callers/callees, property readers/writers, hybrid search) go through SQLite + ChromaDB — Neo4j is never touched at query time. |
 
 ---
 
@@ -792,6 +794,7 @@ OLLAMA_MODEL=llama3.2:3b
 13. Extracts API→Database execution paths via weighted GDS Dijkstra (CALLS=1, REMOTE_CALLS=5)
 14. Generates flow narratives for each execution path
 15. Generates Global GraphRAG rollup (L2 sub-system + L3 Global Architecture)
+16. **Exports Neo4j graph → SQLite** (`data/nexus_graph.db`) — the live API reads from this file, not Neo4j
 
 ### Asking questions
 
@@ -805,12 +808,44 @@ py main.py query "what is the overarching architecture of this system?"
 The last query uses **Route D (Global)** — returns the pre-computed L3 Global
 Architecture Document without any LLM call.
 
+### Adding a new repo / updating after code changes
+
+**Add a new repo:**
+1. Edit `sample_repos/repos.yaml` and add the repo entry.
+2. Run full ingest (SQLite export runs automatically at the end):
+```powershell
+py main.py ingest
+```
+3. Restart the API to pick up the new SQLite file:
+```powershell
+docker-compose restart nexus-api
+```
+
+**After code changes in an existing repo:**
+Same — re-run `py main.py ingest`. The pipeline re-parses changed files, updates Neo4j,
+and exports a fresh SQLite snapshot automatically.
+
+**Refresh SQLite only** (Neo4j already has the latest graph, no re-parse needed):
+```powershell
+py -c "from graph.sqlite_exporter import run_export; run_export()"
+docker-compose restart nexus-api
+```
+This completes in ~5 seconds.
+
+| Scenario | Command | Time |
+|---|---|---|
+| New repo or code change | `py main.py ingest` | Full pipeline (~4h for 10 repos) |
+| SQLite-only refresh | `py -c "from graph.sqlite_exporter import run_export; run_export()"` | ~5 seconds |
+| Apply to live API | `docker-compose restart nexus-api` | ~10 seconds |
+
+---
+
 ### Wiping everything and starting fresh
 
 ```powershell
 docker compose down -v    # Delete all stored data
 docker compose up -d      # Start fresh containers
-py main.py ingest         # Re-ingest
+py main.py ingest         # Re-ingest (also regenerates data/nexus_graph.db)
 ```
 
 ---
@@ -888,6 +923,18 @@ in enterprise codebases like WSO2.
 Neo4j cannot natively store a list of maps (objects) as a node property. So `list[dict]`
 annotation data like `[{"name": "Value", "value": "${key}"}]` is serialized as a JSON string
 before writing to Neo4j. You can query it with APOC: `apoc.convert.fromJsonList(n.annotations)`.
+
+**Q: Does the live API need Neo4j running?**
+No. Since the SQLite migration, the live API (`api/app.py`) and the chat CLI (`chat.py`) read
+exclusively from `data/nexus_graph.db` (SQLite) and ChromaDB. Neo4j only needs to be running
+during `py main.py ingest`. You can stop Neo4j after ingestion with `docker-compose stop neo4j`
+and the API will continue to work normally.
+
+**Q: What is `data/nexus_graph.db`?**
+A SQLite file generated automatically at the end of every ingest run. It contains a full snapshot
+of the Neo4j graph (nodes, CALLS edges, property edges, DataSink table edges) exported into flat
+tables for fast, low-memory queries. The live API reads exclusively from this file — no Neo4j
+connection required at query time.
 
 **Q: What is the DATA_BUDGET in prompt_builder.py?**
 It's `max_context_tokens - SYSTEM_TOKENS - OUTPUT_RESERVE = 8000 - 200 - 1000 = 6800 tokens`.

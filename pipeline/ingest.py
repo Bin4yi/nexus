@@ -123,6 +123,8 @@ def _serialize_lu(lu) -> dict:
         "docstring": lu.docstring,
         "annotations": lu.annotations,
         "calls": lu.calls,
+        "property_reads": lu.property_reads,
+        "property_writes": lu.property_writes,
         "throws": lu.throws,
         "instantiates": lu.instantiates,
         "overrides": lu.overrides,

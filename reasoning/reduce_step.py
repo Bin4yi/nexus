@@ -35,7 +35,9 @@ NO_COMMUNITIES_MESSAGE = "No relevant code communities were identified for this 
 _SAFETY_RE = re.compile(
     r'\b(is it safe|safely remove|safe to remove|safe to delete|ok to remove|okay to remove|'
     r'can i remove|can i delete|can i drop|should i remove|should i delete|should i drop|'
-    r'is .+ safe to|still used|unused|dead code|'
+    r'can\b.{0,35}\bremoved\b|can\b.{0,35}\bdeleted\b|can\b.{0,35}\bdropped\b|'
+    r'\bremovable\b|is\b.{0,35}\bsafe to\b|'
+    r'still used|unused|dead code|'
     r'(?:remove|delete|drop|deprecate|eliminate)\b.{0,40}\bsafely\b)\b',
     re.IGNORECASE,
 )
@@ -135,9 +137,14 @@ NO_COMMUNITIES_MESSAGE = "No relevant code communities were identified for this 
 
 SYSTEM_SAFETY = (
     "You are a senior Java architect performing an exact safety assessment. "
-    "You have been given EXACT grep evidence showing every location where a symbol is used. "
+    "You have been given EXACT grep evidence showing every location where a symbol is used, "
+    "AND property-access graph evidence showing which methods read/write this key at runtime. "
     "Your job is to give a direct YES or NO verdict on whether it is safe to remove/change the symbol. "
-    "Base your verdict ONLY on the evidence provided — if grep shows zero production callers, say YES. "
+    "Base your verdict ONLY on the evidence provided — if grep shows zero production callers AND "
+    "the property graph shows zero readers, say YES. "
+    "The property-access graph is authoritative for runtime key usage: "
+    "if 'Property readers (graph): NONE' appears, the stored value is NEVER read back — "
+    "the write call AND the constant can both be safely removed. "
     "DO NOT invent risks that are not supported by the evidence."
 )
 
@@ -313,6 +320,9 @@ TEMPLATE_SAFETY = """
 ## Question
 {query}
 
+## Property Access Graph Evidence (runtime read/write tracking)
+{property_evidence}
+
 ## Exact Grep Evidence (every occurrence of this symbol in the codebase)
 {grep_evidence}
 
@@ -322,18 +332,30 @@ TEMPLATE_SAFETY = """
 ---
 
 Answer the question with a precise safety verdict. Use these rules:
-- If **Production usages = 0**: Verdict is **YES** — safe to remove. Only clean up the definition file and imports.
-- If **Production usages = N > 0**: Verdict is **YES WITH CHANGES** — can be removed after updating those N call sites.
-  List exactly which files and methods must be updated.
-- Never say NO unless removing the constant would cause a breaking API change visible to external consumers.
+
+**STEP 1 — Cross-check graph vs grep for reads:**
+Before trusting "Property readers (graph): NONE", scan the Grep Evidence for any lines that:
+- call `getProperty(CONSTANT_NAME)` or `getAttribute(CONSTANT_NAME)`
+- call `.get(CONSTANT_NAME)` on any map/properties object
+- call `.containsKey(CONSTANT_NAME)` or `.getParameter(CONSTANT_NAME)`
+- access extended attributes with this key
+If ANY such lines appear in grep — even if the property graph says 0 readers — treat the constant as ACTIVELY READ.
+The property graph tracks direct OAuthTokenReqMessageContext calls only; it DOES NOT capture map.get(), extended attributes, or chained calls like getProperties().get(KEY).
+
+**STEP 2 — Verdict rules:**
+- If grep shows zero non-definition, non-import, non-test usages AND property graph shows 0 readers AND grep shows no `.get(`/`.containsKey(`/`.getProperty(` on this key: **YES** — safe to remove completely.
+- If grep shows production usages (writes, reads, checks): **NO** or **YES WITH CHANGES** — list every call site.
+- "Property readers (graph): NONE" alone is NOT sufficient evidence for a YES verdict if grep shows any read-like usages.
+- Never say YES just because the graph shows 0 readers — always check the grep evidence for reads.
 - Do NOT count the constant's own definition file or import statements as "callers".
 
 Structure your answer:
 1. **Verdict**: YES / YES WITH CHANGES / NO — one sentence.
-2. **Production callers that must change** (from grep): List file + line + what to change at each call site.
+2. **Property access evidence**: How many methods write this key? How many read it back? (from graph)
+3. **Production callers that must change** (from grep): List file + line + what to change at each call site.
    If none, say "No production callers — only the definition must be deleted."
-3. **Test callers** (from grep): These are auto-updated when the constant is removed.
-4. **Minimal change set**: The exact steps (1-3 lines) to safely remove this constant.
+4. **Test callers** (from grep): These are auto-updated when the constant is removed.
+5. **Minimal change set**: The exact steps (1-3 lines) to safely remove this constant.
 """.strip()
 
 TEMPLATE_IMPACT = """
@@ -482,6 +504,9 @@ TEMPLATE_GENERAL = """
 ## Question
 {query}
 
+## Property Access Graph Evidence (runtime read/write tracking — empty if not a property key query)
+{property_evidence}
+
 ## Code Evidence — Actual source code read from the repository (±10 lines around each grep hit)
 {code_snippets}
 
@@ -497,6 +522,10 @@ TEMPLATE_GENERAL = """
 ---
 
 Show what code EXISTS in the repository that answers this question. This is a knowledge base — show code, don't give instructions.
+
+If the Property Access Graph Evidence section above contains data and the question asks whether something can be removed:
+- "Property readers (graph): NONE" means the stored value is never read back → the write call AND constant are safe to remove.
+- "Property readers (graph): N methods" means the value IS consumed at runtime → removing it breaks those readers.
 
 **Structure:**
 1. **Direct answer** — 1-2 sentences stating what the code shows.
@@ -638,6 +667,7 @@ class ReduceStep:
         primary_targets: list[dict] | None = None,
         code_snippets: list | None = None,    # CodeSnippet objects from CodeFetcher
         route: str = "",
+        intent: str = "",     # LLM-classified intent from QueryClassification (overrides regex detection)
         on_token=None,        # optional callable(str) — streams final answer tokens to caller
     ) -> str:
         """
@@ -655,7 +685,9 @@ class ReduceStep:
             return self._run_global(map_results, query)
 
         targets    = primary_targets or []
-        intent     = self._detect_intent(query)
+        # Use LLM-classified intent if provided; fall back to regex detection
+        _VALID_INTENTS = {"safety", "code", "narrative", "impact", "capability", "general"}
+        intent = intent if intent in _VALID_INTENTS else self._detect_intent(query)
         if intent == "safety":
             system_msg = SYSTEM_SAFETY
         elif intent == "code":
@@ -670,12 +702,34 @@ class ReduceStep:
             system_msg = SYSTEM_GENERAL
 
         # Separate grep evidence from graph/semantic hits
-        grep_hits     = [t for t in targets if t.get("source") == "grep"]
-        graph_nodes   = [t for t in targets if t.get("source") == "graph"]
-        semantic_hits = [t for t in targets if t.get("source") == "semantic"]
+        grep_hits      = [t for t in targets if t.get("source") == "grep"]
+        graph_nodes    = [t for t in targets if t.get("source") == "graph"]
+        semantic_hits  = [t for t in targets if t.get("source") == "semantic"]
+        prop_readers   = [t for t in targets if t.get("source") == "graph_prop_read"]
+        prop_writers   = [t for t in targets if t.get("source") == "graph_prop_write"]
 
         grep_text    = self._format_grep_evidence(grep_hits)
         targets_text = self._format_graph_nodes(graph_nodes + semantic_hits)
+
+        # Build property-access evidence block (used by safety prompt)
+        prop_evidence_lines = []
+        if prop_writers:
+            prop_evidence_lines.append(
+                f"Property writers (graph) — {len(prop_writers)} method(s) call addProperty/setProperty with this key:"
+            )
+            for w in prop_writers[:10]:
+                prop_evidence_lines.append(f"  WRITE  {w.get('fqn', '?')}  [{w.get('file_path', '')}:{w.get('start_line', '')}]")
+        else:
+            prop_evidence_lines.append("Property writers (graph): NONE — no method writes this key via addProperty/setProperty.")
+        if prop_readers:
+            prop_evidence_lines.append(
+                f"Property readers (graph) — {len(prop_readers)} method(s) call getProperty with this key:"
+            )
+            for r in prop_readers[:10]:
+                prop_evidence_lines.append(f"  READ   {r.get('fqn', '?')}  [{r.get('file_path', '')}:{r.get('start_line', '')}]")
+        else:
+            prop_evidence_lines.append("Property readers (graph): NONE — no method reads this key back via getProperty.")
+        prop_evidence_text = "\n".join(prop_evidence_lines)
         summaries_text, n_included = self._build_summaries_text(
             map_results,
             budget=NARRATIVE_SUMMARY_BUDGET if intent == "narrative" else SUMMARY_BUDGET,
@@ -691,12 +745,13 @@ class ReduceStep:
         )
 
         # Guard: if there is literally no evidence at all, bail early.
-        if not summaries_text and not snippets_text and not grep_hits and not graph_nodes:
+        if not summaries_text and not snippets_text and not grep_hits and not graph_nodes and not prop_readers and not prop_writers:
             return NO_COMMUNITIES_MESSAGE
 
         # Guard: safety/impact queries with no grep or code evidence are unreliable.
         # Community summaries alone cannot prove a constant is unused — refuse to guess.
-        if intent in ("safety", "impact") and not grep_hits and not graph_nodes and not snippets_text:
+        # Exception: property graph evidence (prop_readers/prop_writers) IS reliable — allow through.
+        if intent in ("safety", "impact") and not grep_hits and not graph_nodes and not snippets_text and not prop_readers and not prop_writers:
             return (
                 "I cannot give a safe removal verdict without grep evidence. "
                 "Try rephrasing with the exact UPPER_SNAKE_CASE constant name (e.g. IMPERSONATING_ACTOR) "
@@ -722,6 +777,7 @@ class ReduceStep:
         elif intent == "safety":
             prompt = TEMPLATE_SAFETY.format(
                 query=query or "(no query)",
+                property_evidence=prop_evidence_text,
                 grep_evidence=grep_text,
                 community_summaries=summaries_text or "(no community data)",
             )
@@ -743,6 +799,7 @@ class ReduceStep:
             # General — include all evidence sources
             prompt = TEMPLATE_GENERAL.format(
                 query=query or "(no query)",
+                property_evidence=prop_evidence_text if (prop_readers or prop_writers) else "(no property access data for this query)",
                 code_snippets=snippets_text or "(no source code fetched)",
                 grep_evidence=grep_text or "(no grep evidence found)",
                 primary_targets=targets_text or "(no specific code entities found)",

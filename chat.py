@@ -77,18 +77,16 @@ def _init_pipeline() -> bool:
         from config.settings import settings
         from reasoning.router import QueryRouter
         from reasoning.reduce_step import ReduceStep
-        from reasoning.graph_retriever import GraphRetriever
+        from graph.sqlite_retriever import SqliteRetriever
         from reasoning.code_fetcher import CodeFetcher
 
         chroma    = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
-        driver    = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
         router    = QueryRouter(chroma_client=chroma)
         reduce    = ReduceStep()
-        retriever = GraphRetriever(chroma_client=chroma)
+        retriever = SqliteRetriever(db_path=settings.sqlite_db_path, chroma_client=chroma)
         fetcher   = CodeFetcher()
 
         _pipeline["chroma"]    = chroma
-        _pipeline["driver"]    = driver
         _pipeline["router"]    = router
         _pipeline["reduce"]    = reduce
         _pipeline["retriever"] = retriever
@@ -186,6 +184,18 @@ def _run_query(question: str, conversation_history: list[dict] | None = None) ->
                         if nfqn and nfqn not in seen_fqns:
                             primary_targets.append({**neighbor, "source": "graph"})
                             seen_fqns.add(nfqn)
+                # If query mentions a constant/key name, surface who reads/writes it
+                for sym in (result.symbols or []):
+                    for reader in router.retriever.find_property_readers(sym)[:5]:
+                        rfqn = reader.get("fqn")
+                        if rfqn and rfqn not in seen_fqns:
+                            primary_targets.append({**reader, "source": "graph_prop_read"})
+                            seen_fqns.add(rfqn)
+                    for writer in router.retriever.find_property_writers(sym)[:5]:
+                        wfqn = writer.get("fqn")
+                        if wfqn and wfqn not in seen_fqns:
+                            primary_targets.append({**writer, "source": "graph_prop_write"})
+                            seen_fqns.add(wfqn)
             except Exception as e:
                 logger.debug("Neighbor expansion failed: %s", e)
 
@@ -249,6 +259,7 @@ def _run_query(question: str, conversation_history: list[dict] | None = None) ->
         primary_targets=primary_targets,
         code_snippets=code_snippets,
         route=result.route,
+        intent=result.intent,
     )
 
     resp = build_query_response(result, answer, 0)
@@ -348,6 +359,18 @@ def _run_query_streaming(question: str, conversation_history: list[dict] | None 
                         if nfqn and nfqn not in seen_fqns:
                             primary_targets.append({**neighbor, "source": "graph"})
                             seen_fqns.add(nfqn)
+                # If query mentions a constant/key name, surface who reads/writes it
+                for sym in (result.symbols or []):
+                    for reader in router.retriever.find_property_readers(sym)[:5]:
+                        rfqn = reader.get("fqn")
+                        if rfqn and rfqn not in seen_fqns:
+                            primary_targets.append({**reader, "source": "graph_prop_read"})
+                            seen_fqns.add(rfqn)
+                    for writer in router.retriever.find_property_writers(sym)[:5]:
+                        wfqn = writer.get("fqn")
+                        if wfqn and wfqn not in seen_fqns:
+                            primary_targets.append({**writer, "source": "graph_prop_write"})
+                            seen_fqns.add(wfqn)
             except Exception as e:
                 logger.debug("Neighbor expansion failed: %s", e)
 
@@ -427,6 +450,7 @@ def _run_query_streaming(question: str, conversation_history: list[dict] | None 
         primary_targets=primary_targets,
         code_snippets=code_snippets,
         route=result.route,
+        intent=result.intent,
         on_token=_on_token,
     )
     print()  # newline after streamed answer
@@ -463,25 +487,14 @@ def _print_answer_footer(result: dict, latency_ms: float) -> None:
 
 
 def _run_explain(fqn: str) -> dict:
-    from config.settings import settings
     retriever = _pipeline["retriever"]
     reduce    = _pipeline["reduce"]
-    driver    = _pipeline["driver"]
 
-    with driver.session() as s:
-        rec = s.run(
-            "MATCH (n {fqn: $fqn}) "
-            "RETURN labels(n)[0] AS node_type, n.geid AS geid, "
-            "n.blast_radius_risk AS blast_radius_risk, "
-            "n.entry_point_score AS entry_point_score, "
-            "n.community_id AS community_id, "
-            "n.file_path AS file_path, n.start_line AS start_line, n.end_line AS end_line "
-            "LIMIT 1",
-            fqn=fqn,
-        ).single()
-
-    if not rec:
+    nodes = retriever.find_nodes_by_fqns([fqn])
+    if not nodes:
         return {"error": f"Not found in graph: {fqn}"}
+
+    rec = nodes[0]
 
     raw_callers = retriever.get_callers(fqn, depth=1)
     raw_callees = retriever.get_callees(fqn, depth=1)
@@ -498,10 +511,10 @@ def _run_explain(fqn: str) -> dict:
 
     return {
         "fqn":               fqn,
-        "node_type":         rec["node_type"],
-        "blast_radius_risk": rec["blast_radius_risk"],
-        "entry_point_score": rec["entry_point_score"],
-        "community_id":      rec["community_id"],
+        "node_type":         rec.get("node_type"),
+        "blast_radius_risk": rec.get("blast_radius_risk"),
+        "entry_point_score": rec.get("entry_point_score"),
+        "community_id":      rec.get("community_id"),
         "callers":           raw_callers[:15],
         "callees":           raw_callees[:15],
         "explanation":       explanation,
@@ -509,34 +522,61 @@ def _run_explain(fqn: str) -> dict:
 
 
 def _run_stats() -> dict:
-    import chromadb
+    import sqlite3
     from config.settings import settings
 
-    driver = _pipeline["driver"]
     chroma = _pipeline["chroma"]
-
-    def _count(s, label, is_rel=False):
-        try:
-            if is_rel:
-                return s.run(f"MATCH ()-[r:{label}]->() RETURN count(r) AS c").single()["c"]
-            return s.run(f"MATCH (n:{label}) RETURN count(n) AS c").single()["c"]
-        except Exception:
-            return 0
+    db_path = str(settings.sqlite_db_path)
 
     out = {}
-    with driver.session() as s:
-        out["Components"]    = _count(s, "Component")
-        out["LogicUnits"]    = _count(s, "LogicUnit")
-        out["Fields"]        = _count(s, "Field")
-        out["SpecSections"]  = _count(s, "SpecSection")
-        out["CALLS edges"]   = _count(s, "CALLS", True)
-        out["IMPLEMENTS_SPEC"] = _count(s, "IMPLEMENTS_SPEC", True)
-        out["EntryPoints"]   = _count(s, "EntryPoint")
-        out["DataSinks"]     = _count(s, "DataSink")
-        out["Communities"]   = s.run(
-            "MATCH (n) WHERE n.community_id IS NOT NULL "
-            "RETURN count(DISTINCT n.community_id) AS c"
-        ).single()["c"]
+    try:
+        with sqlite3.connect(db_path) as conn:
+            def _count_nodes(node_type: str) -> int:
+                try:
+                    return conn.execute(
+                        "SELECT count(*) FROM nodes WHERE node_type=?", (node_type,)
+                    ).fetchone()[0]
+                except Exception:
+                    return 0
+
+            def _count_all() -> int:
+                try:
+                    return conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+                except Exception:
+                    return 0
+
+            def _count_calls() -> int:
+                try:
+                    return conn.execute("SELECT count(*) FROM calls_edges").fetchone()[0]
+                except Exception:
+                    return 0
+
+            def _count_prop_edges() -> int:
+                try:
+                    return conn.execute("SELECT count(*) FROM property_edges").fetchone()[0]
+                except Exception:
+                    return 0
+
+            def _count_communities() -> int:
+                try:
+                    return conn.execute(
+                        "SELECT count(DISTINCT community_id) FROM nodes WHERE community_id IS NOT NULL"
+                    ).fetchone()[0]
+                except Exception:
+                    return 0
+
+            out["Components"]      = _count_nodes("Component")
+            out["LogicUnits"]      = _count_nodes("LogicUnit")
+            out["Fields"]          = _count_nodes("Field")
+            out["SpecSections"]    = _count_nodes("SpecSection")
+            out["EntryPoints"]     = _count_nodes("EntryPoint")
+            out["DataSinks"]       = _count_nodes("DataSink")
+            out["Total nodes"]     = _count_all()
+            out["CALLS edges"]     = _count_calls()
+            out["Property edges"]  = _count_prop_edges()
+            out["Communities"]     = _count_communities()
+    except Exception as e:
+        out["sqlite_error"] = str(e)
 
     for col_name in ("code_intent", "code_logic", "community_summaries"):
         try:
@@ -788,11 +828,6 @@ def main() -> None:
         if "router" in _pipeline:
             try:
                 _pipeline["router"].close()
-            except Exception:
-                pass
-        if "driver" in _pipeline:
-            try:
-                _pipeline["driver"].close()
             except Exception:
                 pass
 

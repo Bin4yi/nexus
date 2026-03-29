@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # ── Paths ─────────────────────────────────────────────────────────────────
     repos_mirror_path: Path = Field(default=Path("./mirror"))
     repos_config_path: Path = Field(default=Path("./sample_repos/repos.yaml"))
+    sqlite_db_path:    Path = Field(
+        default=Path("./data/nexus_graph.db"),
+        description="SQLite graph snapshot used by the live API (built after each ingest).",
+    )
 
     # ── LLM ───────────────────────────────────────────────────────────────────
     llm_provider: str = Field(default="openai")

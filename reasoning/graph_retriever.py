@@ -702,6 +702,59 @@ class GraphRetriever:
         return rows
 
     @_neo4j_retry
+    def find_property_readers(self, key: str) -> list[dict]:
+        """
+        Find all LogicUnit nodes that READ a property key via getProperty(key) etc.
+        Used to answer "is this constant/key ever read back?" questions.
+        Returns {fqn, file_path, start_line, end_line, community_id}
+        """
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (lu:LogicUnit)-[:READS_PROPERTY]->(k:PropertyKey)
+                WHERE k.key = $key OR k.key CONTAINS $key
+                RETURN DISTINCT
+                    lu.fqn          AS fqn,
+                    lu.file_path    AS file_path,
+                    lu.start_line   AS start_line,
+                    lu.end_line     AS end_line,
+                    lu.community_id AS community_id
+                ORDER BY lu.fqn
+                LIMIT 20
+                """,
+                key=key,
+            )
+            rows = [dict(r) for r in result]
+        logger.info("find_property_readers('%s') → %d nodes", key, len(rows))
+        return rows
+
+    @_neo4j_retry
+    def find_property_writers(self, key: str) -> list[dict]:
+        """
+        Find all LogicUnit nodes that WRITE a property key via addProperty(key, v) etc.
+        Returns {fqn, file_path, start_line, end_line, community_id}
+        """
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (lu:LogicUnit)-[:WRITES_PROPERTY]->(k:PropertyKey)
+                WHERE k.key = $key OR k.key CONTAINS $key
+                RETURN DISTINCT
+                    lu.fqn          AS fqn,
+                    lu.file_path    AS file_path,
+                    lu.start_line   AS start_line,
+                    lu.end_line     AS end_line,
+                    lu.community_id AS community_id
+                ORDER BY lu.fqn
+                LIMIT 20
+                """,
+                key=key,
+            )
+            rows = [dict(r) for r in result]
+        logger.info("find_property_writers('%s') → %d nodes", key, len(rows))
+        return rows
+
+    @_neo4j_retry
     def find_throw_sites(self, exception_name: str) -> list[dict]:
         """
         Find all LogicUnit nodes that throw a given exception by name.

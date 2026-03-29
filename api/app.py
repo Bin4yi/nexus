@@ -38,24 +38,25 @@ _state: dict = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialise Neo4j, ChromaDB, and the reasoning pipeline at startup."""
+    """Initialise ChromaDB and the reasoning pipeline at startup.
+    Neo4j is NOT used by the live API — all graph lookups go through SQLite.
+    """
     import chromadb
-    from neo4j import GraphDatabase
     from reasoning.router import QueryRouter
     from reasoning.reduce_step import ReduceStep
-    from reasoning.map_step import MapStep
-    from reasoning.graph_retriever import GraphRetriever
+    from graph.sqlite_retriever import SqliteRetriever
 
     logger.info("CodeNexus API starting up…")
 
     chroma = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
-    neo4j  = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
 
     _state["chroma"]    = chroma
-    _state["neo4j"]     = neo4j
     _state["router"]    = QueryRouter(chroma_client=chroma)
     _state["reduce"]    = ReduceStep()
-    _state["retriever"] = GraphRetriever(chroma_client=chroma)
+    _state["retriever"] = SqliteRetriever(
+        db_path=settings.sqlite_db_path,
+        chroma_client=chroma,
+    )
 
     try:
         from reasoning.map_step import MapStep
@@ -64,12 +65,11 @@ async def lifespan(app: FastAPI):
         logger.warning("MapStep not available: %s", e)
         _state["map"] = None
 
-    logger.info("CodeNexus API ready.")
+    logger.info("CodeNexus API ready (graph: SQLite, vectors: ChromaDB).")
     yield
 
     # Shutdown
     _state["router"].close()
-    neo4j.close()
     logger.info("CodeNexus API shut down.")
 
 
@@ -238,6 +238,7 @@ async def query(req: QueryRequest, _=Depends(verify_api_key)):
             primary_targets=primary_targets,
             code_snippets=code_snippets,
             route=result.route,
+            intent=result.intent,
         )
     except Exception as e:
         logger.error("ReduceStep failed: %s", e)

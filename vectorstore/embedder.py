@@ -45,10 +45,12 @@ class ChromaEmbedder:
         self._logic_col = client.get_or_create_collection(
             name=COLLECTION_CODE_LOGIC,
             embedding_function=self._emb_fn,
+            metadata={"hnsw:space": "cosine"},
         )
         self._intent_col = client.get_or_create_collection(
             name=COLLECTION_CODE_INTENT,
             embedding_function=self._emb_fn,
+            metadata={"hnsw:space": "cosine"},
         )
 
     def upsert_chunks(self, chunks: list[EmbeddingChunk]) -> None:

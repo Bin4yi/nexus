@@ -376,6 +376,9 @@ class IngestionPipeline:
         # Tier 3: Polish
         logger.info("Loading Tier 3 edges...")
 
+        # READS_PROPERTY / WRITES_PROPERTY — runtime property map key tracking
+        self.loader.load_property_access_edges(all_logic_units)
+
         # THROWS — exception graph
         self.loader.load_throws_edges(all_logic_units)
 
@@ -479,6 +482,20 @@ class IngestionPipeline:
                 )
             except Exception as e:
                 logger.error("Global rollup failed: %s", e)
+
+        # ── Export graph snapshot to SQLite for live API ──────────────────────
+        # After this step the live API reads from SQLite only — Neo4j is offline.
+        self._set_status("stage", "sqlite_export")
+        try:
+            from graph.sqlite_exporter import export_graph_to_sqlite
+            export_stats = export_graph_to_sqlite(
+                self.neo4j_driver, settings.sqlite_db_path,
+            )
+            stats["sqlite_nodes"]  = export_stats.get("nodes", 0)
+            stats["sqlite_edges"]  = export_stats.get("calls_edges", 0)
+            logger.info("SQLite export complete: %s", export_stats)
+        except Exception as e:
+            logger.error("SQLite export failed (non-fatal — live API will use stale snapshot): %s", e)
 
         self._set_status("stage", "done")
         logger.info("Pipeline complete: %s", stats)

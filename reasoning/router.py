@@ -43,7 +43,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from config.settings import settings, llm_chat
-from reasoning.graph_retriever import GraphRetriever
+from graph.sqlite_retriever import SqliteRetriever
 from reasoning.lexical_search import LexicalSearcher, GrepHit
 from community.summarizer import COLLECTION_NAME as COMMUNITY_COLLECTION
 from community.global_rollup import GlobalRollup
@@ -62,6 +62,7 @@ class QueryClassification:
     symbols: list[str]   # UPPER_SNAKE / quoted literals for grep
     entity_names: list[str]  # CamelCase / FQN candidates
     clean_query: str = ""    # typo-corrected query for semantic search (LLM parser only)
+    intent: str = ""         # "safety" | "code" | "narrative" | "impact" | "capability" | "general"
 
 
 @dataclass
@@ -75,6 +76,7 @@ class RouterResult:
     community_summaries: list[dict]    # fetched by ID (deterministic) or by vector
     entity_names: list[str]            # extracted candidate names
     symbols: list[str]                 # symbols passed to grep (Route A)
+    intent: str = "general"            # LLM-classified answer intent
 
 
 # ── Query classifier (pure logic, no DB) ─────────────────────────────────────
@@ -245,6 +247,7 @@ class LLMQueryParser:
         "Given a developer's question, return a JSON object with exactly these fields:\n"
         "{\n"
         '  "route": "global" | "symbolic" | "exact" | "conceptual",\n'
+        '  "intent": "safety" | "code" | "narrative" | "impact" | "capability" | "general",\n'
         '  "symbols": [...],\n'
         '  "entity_names": [...],\n'
         '  "clean_query": "..."\n'
@@ -257,6 +260,19 @@ class LLMQueryParser:
         "  exact      — mentions a specific Java class or method name\n"
         "  conceptual — feature understanding, how-does-X-work, implement-X questions, OR questions about which communities/components handle a specific topic\n\n"
         "IMPORTANT: Questions like 'which communities handle token validation' or 'which components are responsible for X' are CONCEPTUAL, not global.\n\n"
+
+        "INTENT meanings:\n"
+        "  safety     — asks whether something can be removed, deleted, is unused, or is safe to change\n"
+        "               Examples: 'can X be removed', 'is it safe to delete', 'is this constant still used', 'can I drop this'\n"
+        "  code       — asks to see or show existing source code, or how to implement/add something\n"
+        "               Examples: 'show me', 'give me the file', 'how to implement', 'what does X look like'\n"
+        "  narrative  — asks for a full end-to-end explanation of how a feature works\n"
+        "               Examples: 'walk me through', 'explain the flow', 'how does X work end to end'\n"
+        "  impact     — asks about blast radius, what breaks, what callers exist\n"
+        "               Examples: 'what calls X', 'what would break', 'impact of changing X'\n"
+        "  capability — asks whether the system supports or enforces a specific behaviour\n"
+        "               Examples: 'does it support', 'can it handle multiple', 'is X enforced'\n"
+        "  general    — everything else: factual questions, architectural questions, lookup questions\n\n"
 
         "symbols — UPPER_SNAKE_CASE constant names AND lowercase string literals to grep for.\n"
         "  Derive likely names from the question context, even when not explicitly stated.\n"
@@ -325,6 +341,7 @@ class LLMQueryParser:
             data = json.loads(raw)
 
             route        = data.get("route", "conceptual")
+            intent       = data.get("intent", "general")
             symbols      = [s for s in data.get("symbols", []) if isinstance(s, str) and s.strip()]
             entity_names = [e for e in data.get("entity_names", []) if isinstance(e, str) and e.strip()]
             clean_query  = data.get("clean_query", question) or question
@@ -334,12 +351,17 @@ class LLMQueryParser:
             symbols      = [s for s in symbols      if not _typo_re.search(s)]
             entity_names = [e for e in entity_names if not _typo_re.search(e)]
 
+            # Validate intent against known values
+            _VALID_INTENTS = {"safety", "code", "narrative", "impact", "capability", "general"}
+            if intent not in _VALID_INTENTS:
+                intent = "general"
+
             confidence = 0.9 if (symbols or entity_names) else 0.55
             logger.info(
-                "LLM parser: route=%s symbols=%s entities=%s",
-                route, symbols[:4], entity_names[:4],
+                "LLM parser: route=%s intent=%s symbols=%s entities=%s",
+                route, intent, symbols[:4], entity_names[:4],
             )
-            return QueryClassification(route, confidence, symbols, entity_names, clean_query)
+            return QueryClassification(route, confidence, symbols, entity_names, clean_query, intent)
 
         except Exception as e:
             logger.error("LLM query parser failed (model=%s) — falling back to regex: %s", self._model, e)
@@ -365,7 +387,10 @@ class QueryRouter:
         self._chroma_port = getattr(chroma_client, '_port', None) or getattr(
             chroma_client, 'port', None
         )
-        self.retriever  = GraphRetriever(chroma_client=chroma_client)
+        self.retriever  = SqliteRetriever(
+            db_path=settings.sqlite_db_path,
+            chroma_client=chroma_client,
+        )
         self.lexical    = LexicalSearcher()
         self.llm_parser = LLMQueryParser()   # primary: LLM-based extraction
         self.classifier = QueryClassifier()  # fallback: regex-based extraction
@@ -518,6 +543,7 @@ class QueryRouter:
             community_summaries=community_summaries,
             entity_names=entity_names,
             symbols=symbols,
+            intent=classification.intent,
         )
 
     def _global_route(self, question: str) -> RouterResult:

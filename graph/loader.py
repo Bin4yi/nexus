@@ -644,6 +644,60 @@ class Neo4jLoader:
                 ).consume()
         logger.info("Loaded %d READS_CONFIG edges", len(edges))
 
+    def load_property_access_edges(self, logic_units: list) -> None:
+        """
+        Create [:READS_PROPERTY] and [:WRITES_PROPERTY] edges from LogicUnit
+        → PropertyKey nodes, enabling "who reads/writes this key?" queries.
+
+        PropertyKey {key} nodes are MERGE'd on the key string — one node per
+        unique key across the entire graph.
+        """
+        reads_pairs = [
+            {"geid": lu.geid, "key": key}
+            for lu in logic_units
+            for key in lu.property_reads
+        ]
+        writes_pairs = [
+            {"geid": lu.geid, "key": key}
+            for lu in logic_units
+            for key in lu.property_writes
+        ]
+        if not reads_pairs and not writes_pairs:
+            return
+        with self.driver.session() as session:
+            if reads_pairs:
+                session.run(
+                    """
+                    CALL apoc.periodic.iterate(
+                        'UNWIND $pairs AS pair RETURN pair',
+                        'MATCH (lu:LogicUnit {geid: pair.geid})
+                         MERGE (k:PropertyKey {key: pair.key})
+                         MERGE (lu)-[:READS_PROPERTY]->(k)',
+                        {batchSize: $batch_size, params: {pairs: $pairs}}
+                    )
+                    """,
+                    pairs=reads_pairs,
+                    batch_size=settings.batch_size,
+                ).consume()
+            if writes_pairs:
+                session.run(
+                    """
+                    CALL apoc.periodic.iterate(
+                        'UNWIND $pairs AS pair RETURN pair',
+                        'MATCH (lu:LogicUnit {geid: pair.geid})
+                         MERGE (k:PropertyKey {key: pair.key})
+                         MERGE (lu)-[:WRITES_PROPERTY]->(k)',
+                        {batchSize: $batch_size, params: {pairs: $pairs}}
+                    )
+                    """,
+                    pairs=writes_pairs,
+                    batch_size=settings.batch_size,
+                ).consume()
+        logger.info(
+            "Loaded %d READS_PROPERTY + %d WRITES_PROPERTY edges",
+            len(reads_pairs), len(writes_pairs),
+        )
+
     def load_resolves_to_edges(self, edges: list) -> None:
         """
         Create [:RESOLVES_TO] edges from Interface Component → Implementation Component.

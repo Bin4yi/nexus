@@ -29,6 +29,21 @@ _javadoc_parser = JavadocParser()
 # Injection annotations (Tier 2: INJECTS edge)
 _INJECT_ANNOTATIONS = {"@Autowired", "@Inject", "@Resource", "@Reference", "@OSGiService"}
 
+# Property map read methods — getProperty(key) pattern
+# Includes containsKey/remove so we catch map-level reads like
+#   props.containsKey(KEY), customClaims.remove(KEY), params.get(KEY)
+_PROPERTY_READ_METHODS = {
+    "getProperty", "getAttribute", "getClaim", "getRequestParam",
+    "getParameter", "get", "getHeader",
+    "containsKey", "remove", "getExtendedAttribute", "getParameters",
+}
+
+# Property map write methods — addProperty(key, value) pattern
+_PROPERTY_WRITE_METHODS = {
+    "addProperty", "setProperty", "setAttribute", "setClaim", "put",
+    "addExtendedAttribute", "setExtendedAttribute",
+}
+
 # WSO2 / Spring event handler base types
 _EVENT_HANDLER_BASES = {
     "AbstractEventHandler", "EventHandler", "IdentityEventHandler",
@@ -226,6 +241,7 @@ class JavaParser:
         return_type = self._extract_return_type(node, source) if kind == "method" else None
         body_text = self._extract_body_text(node, source)
         calls = self._extract_calls(node, source, imports)
+        property_reads, property_writes = self._extract_property_accesses(node, source)
         annotations = self._extract_annotations(node, source)
         docstring = self._extract_preceding_javadoc(node, source)
         throws = self._extract_throws(node, source, imports)
@@ -289,6 +305,8 @@ class JavaParser:
             deprecated=deprecated,
             annotations=annotations,
             calls=calls,
+            property_reads=property_reads,
+            property_writes=property_writes,
             throws=throws,
             overrides=overrides,
             instantiates=instantiates,
@@ -467,6 +485,64 @@ class JavaParser:
                 acc.append(fqn)
         for child in node.children:
             self._walk_calls(child, source, imports, acc)
+
+    # ── Property access extraction ─────────────────────────────────────────
+
+    def _extract_property_accesses(
+        self, node: Node, source: bytes
+    ) -> tuple[list[str], list[str]]:
+        """
+        Scan a method body for getProperty(key) / addProperty(key, value) patterns.
+        Returns (property_reads, property_writes) as deduplicated key lists.
+        Keys are extracted from string literals or constant identifiers (e.g.
+        IMPERSONATED_SUBJECT or OAuthConstants.IMPERSONATED_SUBJECT).
+        """
+        reads: list[str] = []
+        writes: list[str] = []
+        self._walk_property_accesses(node, source, reads, writes)
+        return list(dict.fromkeys(reads)), list(dict.fromkeys(writes))
+
+    def _walk_property_accesses(
+        self, node: Node, source: bytes, reads: list, writes: list
+    ) -> None:
+        if node.type == "method_invocation":
+            name_node = node.child_by_field_name("name")
+            method_name = (
+                source[name_node.start_byte:name_node.end_byte].decode()
+                if name_node else None
+            )
+            if method_name:
+                args_node = node.child_by_field_name("arguments")
+                key = self._extract_first_arg_key(args_node, source) if args_node else None
+                if key:
+                    if method_name in _PROPERTY_READ_METHODS:
+                        reads.append(key)
+                    elif method_name in _PROPERTY_WRITE_METHODS:
+                        writes.append(key)
+        for child in node.children:
+            self._walk_property_accesses(child, source, reads, writes)
+
+    def _extract_first_arg_key(self, args_node: Node, source: bytes) -> Optional[str]:
+        """
+        Extract the first argument of an argument_list as a string key.
+        Handles: "STRING_LITERAL", IDENTIFIER, Class.FIELD_ACCESS
+        """
+        for child in args_node.children:
+            if child.type == "string_literal":
+                raw = source[child.start_byte:child.end_byte].decode()
+                return raw.strip('"\'')
+            elif child.type == "identifier":
+                return source[child.start_byte:child.end_byte].decode()
+            elif child.type == "field_access":
+                field = child.child_by_field_name("field")
+                if field:
+                    return source[field.start_byte:field.end_byte].decode()
+            elif child.type in (",", "(", ")"):
+                continue
+            else:
+                # Stop at first non-trivial non-key arg (e.g. method call)
+                break
+        return None
 
     def _parse_annotation(self, node: Node, source: bytes) -> dict:
         """Parse an annotation node into a structured dict."""

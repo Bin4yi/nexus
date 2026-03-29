@@ -48,6 +48,8 @@ class LogicUnit(BaseModel):
     deprecated: bool = False            # @deprecated present
     annotations: list[dict] = Field(default_factory=list)   # e.g. [{"name": "Override"}]
     calls: list[str] = Field(default_factory=list)          # FQNs of called methods
+    property_reads: list[str] = Field(default_factory=list)  # keys read via getProperty(key)
+    property_writes: list[str] = Field(default_factory=list) # keys written via addProperty(key,v)
     throws: list[str] = Field(default_factory=list)         # exception types in throws clause
     overrides: Optional[str] = None                         # parent method FQN if @Override
     instantiates: list[str] = Field(default_factory=list)   # class names from `new X()`
