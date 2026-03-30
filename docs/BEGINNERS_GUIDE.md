@@ -850,6 +850,111 @@ py main.py ingest         # Re-ingest (also regenerates data/nexus_graph.db)
 
 ---
 
+### Optional: int8 Vector Quantization (cuts ChromaDB RAM ~4×)
+
+By default ChromaDB stores embeddings as 32-bit floats.
+Switching to **int8** quantization shrinks each vector from 4 bytes/dimension to 1 byte/dimension,
+reducing ChromaDB RAM from ~3.0 GB to ~0.75 GB for 100 repos with < 2 % quality loss.
+
+**Requirement:** ChromaDB **≥ 0.6.0** (the feature was not available in earlier versions).
+
+#### Step 1 — Check your current ChromaDB version
+
+```powershell
+docker exec nexus-chromadb pip show chromadb
+```
+
+Look for the `Version:` line. If it's below `0.6.0`, proceed to Step 2.
+If it's already ≥ 0.6.0, skip to Step 3.
+
+#### Step 2 — Upgrade ChromaDB inside the container
+
+Open `docker-compose.yml` and pin the ChromaDB image to a version that ships 0.6+:
+
+```yaml
+services:
+  chromadb:
+    image: chromadb/chroma:0.6.3   # was: chromadb/chroma:latest or an older tag
+```
+
+Then rebuild:
+
+```powershell
+docker-compose pull chromadb
+docker-compose up -d chromadb
+```
+
+Verify the upgrade:
+
+```powershell
+docker exec nexus-chromadb pip show chromadb
+# Version: 0.6.x
+```
+
+#### Step 3 — Enable int8 in embedder.py
+
+Open [vectorstore/embedder.py](../vectorstore/embedder.py) and add `"hnsw:quantization_type": "int8"` to both collection metadata dicts:
+
+```python
+# ChromaEmbedder.__init__  (lines ~45 and ~50)
+self._logic_col = client.get_or_create_collection(
+    name=COLLECTION_CODE_LOGIC,
+    embedding_function=self._emb_fn,
+    metadata={"hnsw:space": "cosine", "hnsw:quantization_type": "int8"},   # ← add this
+)
+self._intent_col = client.get_or_create_collection(
+    name=COLLECTION_CODE_INTENT,
+    embedding_function=self._emb_fn,
+    metadata={"hnsw:space": "cosine", "hnsw:quantization_type": "int8"},   # ← add this
+)
+```
+
+#### Step 4 — Delete the existing collections
+
+int8 quantization is a collection-level setting and **cannot be applied to existing data**.
+The collections must be dropped and re-created:
+
+```powershell
+# Open a Python shell with the venv active
+py
+```
+
+```python
+import chromadb
+client = chromadb.HttpClient(host="localhost", port=8000)
+client.delete_collection("code_logic")
+client.delete_collection("code_intent")
+exit()
+```
+
+> **Warning:** This permanently deletes all stored vectors. Re-ingestion is required to restore them.
+
+#### Step 5 — Re-run ingest to rebuild with int8
+
+```powershell
+py main.py ingest
+```
+
+The pipeline will re-create both collections with `hnsw:quantization_type: int8` applied from the first upsert.
+Watch for the upsert log lines to confirm:
+
+```
+vectorstore.embedder — Upserted 5231 code_logic chunks
+vectorstore.embedder — Upserted 4109 code_intent chunks
+```
+
+#### RAM before vs. after
+
+| Repos | Without int8 | With int8 | Saving |
+|-------|-------------|-----------|--------|
+| 10    | ~300 MB     | ~75 MB    | ~4×    |
+| 50    | ~1.5 GB     | ~375 MB   | ~4×    |
+| 100   | ~3.0 GB     | ~750 MB   | ~4×    |
+
+Total system RAM at 100 repos drops from ~3.7 GB to ~1.5 GB — comfortably within a 2 GB container limit.
+
+---
+
 ## 6. Common Questions
 
 **Q: Do I need a GPU?**

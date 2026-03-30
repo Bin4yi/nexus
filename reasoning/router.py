@@ -256,10 +256,12 @@ class LLMQueryParser:
         "ROUTE meanings:\n"
         "  global     — asks for true system/architecture overview ONLY: 'big picture', 'how does the whole system work', 'describe the architecture'\n"
         "               Do NOT use global for questions about specific features, communities, or topics.\n"
+        "               'how does X work' where X is a named feature (SSO, OAuth, token exchange, SAML, OIDC, etc.) is NEVER global — it is conceptual.\n"
         "  symbolic   — involves Java constants (UPPER_SNAKE_CASE), string literals, or asks to find/remove a specific value\n"
         "  exact      — mentions a specific Java class or method name\n"
         "  conceptual — feature understanding, how-does-X-work, implement-X questions, OR questions about which communities/components handle a specific topic\n\n"
-        "IMPORTANT: Questions like 'which communities handle token validation' or 'which components are responsible for X' are CONCEPTUAL, not global.\n\n"
+        "IMPORTANT: Questions like 'which communities handle token validation' or 'which components are responsible for X' are CONCEPTUAL, not global.\n"
+        "IMPORTANT: 'how does SSO work', 'how does Single Sign-On work', 'how does token exchange work', 'how does SAML work' are ALL conceptual with intent=narrative.\n\n"
 
         "INTENT meanings:\n"
         "  safety     — asks whether something can be removed, deleted, is unused, or is safe to change\n"
@@ -435,6 +437,22 @@ class QueryRouter:
         )
 
         # ROUTE D — Global architecture: return L3 summary directly (no merge needed)
+        # Guard: if the question asks "how does <specific feature> work", the LLM
+        # sometimes returns global despite the prompt. Downgrade to conceptual so
+        # ChromaDB searches for the actual feature instead of returning the L3 doc.
+        _FEATURE_HOW_RE = re.compile(
+            r'\bhow\s+does\s+\w[\w\s]{1,40}\s+work\b'
+            r'|\bhow\s+(?:is|are)\s+\w[\w\s]{1,40}\s+(?:handled|implemented|processed)\b',
+            re.IGNORECASE,
+        )
+        if classification.bucket == "global" and _FEATURE_HOW_RE.search(question):
+            logger.info(
+                "Downgrading global→conceptual: question matches feature-level 'how does X work' pattern"
+            )
+            classification.bucket = "conceptual"
+            if not classification.intent:
+                classification.intent = "narrative"
+
         if classification.bucket == "global":
             return self._global_route(question)
 
