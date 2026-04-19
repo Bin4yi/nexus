@@ -42,6 +42,8 @@ class SqliteRetriever:
         # In-memory call graph for fast BFS (loaded once at startup)
         self._callers: dict[str, list[str]] = defaultdict(list)  # callee → [callers]
         self._callees: dict[str, list[str]] = defaultdict(list)  # caller → [callees]
+        # Interface → implementing classes (reverse of IMPLEMENTS/EXTENDS edges)
+        self._implementors: dict[str, list[str]] = defaultdict(list)
         self._load_call_graph()
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -53,7 +55,7 @@ class SqliteRetriever:
         return conn
 
     def _load_call_graph(self) -> None:
-        """Load all CALLS edges into Python dicts for O(1) per-hop BFS."""
+        """Load CALLS + IMPLEMENTS/EXTENDS edges into Python dicts for O(1) per-hop BFS."""
         try:
             with sqlite3.connect(self._db_path) as conn:
                 rows = conn.execute(
@@ -68,6 +70,22 @@ class SqliteRetriever:
             )
         except Exception as e:
             logger.warning("Could not load call graph from SQLite (%s): %s", self._db_path, e)
+
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                impl_rows = conn.execute(
+                    "SELECT src_fqn, dst_fqn FROM structure_edges "
+                    "WHERE rel_type IN ('IMPLEMENTS', 'EXTENDS')"
+                ).fetchall()
+            for impl, iface in impl_rows:
+                # iface → impl (so we can find implementations of a given interface)
+                self._implementors[iface].append(impl)
+            logger.info(
+                "SqliteRetriever: %d IMPLEMENTS/EXTENDS edges loaded",
+                len(impl_rows),
+            )
+        except Exception as e:
+            logger.warning("Could not load IMPLEMENTS/EXTENDS edges (%s): %s", self._db_path, e)
 
     def close(self) -> None:
         pass  # SQLite connections are per-call; nothing persistent to close
@@ -188,10 +206,23 @@ class SqliteRetriever:
         for _ in range(depth):
             nxt: set[str] = set()
             for fqn in frontier:
+                # Follow CALLS edges upward (callers)
                 for caller in self._callers.get(fqn, []):
                     if caller not in visited:
                         nxt.add(caller)
                         visited.add(caller)
+                # Follow IMPLEMENTS/EXTENDS downward (implementations of this interface/class)
+                for impl in self._implementors.get(fqn, []):
+                    if impl not in visited:
+                        nxt.add(impl)
+                        visited.add(impl)
+                # Also check short class-name suffix of fqn in case interface is stored unqualified
+                short = fqn.rsplit(".", 1)[-1] if "." in fqn else fqn
+                if short != fqn:
+                    for impl in self._implementors.get(short, []):
+                        if impl not in visited:
+                            nxt.add(impl)
+                            visited.add(impl)
             frontier = nxt
             if not frontier:
                 break
@@ -442,10 +473,41 @@ class SqliteRetriever:
         all_fqns = callee_fqns[:15] + caller_fqns[:10] + sibling_fqns[:10]
         by_fqn   = {n["fqn"]: n for n in self.find_nodes_by_fqns(all_fqns)}
 
+        # ChromaDB code_logic search — method bodies that reference the domain terms
+        code_logic_hits: list[dict] = []
+        if chroma_client and domain_terms:
+            try:
+                col = chroma_client.get_collection("code_logic")
+                query_text = " ".join(domain_terms[:4])
+                results = col.query(
+                    query_texts=[query_text],
+                    n_results=min(10, col.count()),
+                )
+                if results["ids"]:
+                    seen_fqns = set(seed_fqns)
+                    for i, _doc_id in enumerate(results["ids"][0]):
+                        meta = results["metadatas"][0][i]
+                        fqn = meta.get("fqn", "")
+                        if fqn and fqn not in seen_fqns:
+                            seen_fqns.add(fqn)
+                            fp = meta.get("file_path", "")
+                            if "mirror" in fp:
+                                fp = fp[fp.find("mirror"):]
+                            code_logic_hits.append({
+                                "fqn":        fqn,
+                                "file_path":  fp,
+                                "start_line": meta.get("start_line", 0),
+                                "end_line":   meta.get("end_line", 0),
+                                "source":     "code_logic",
+                            })
+            except Exception as e:
+                logger.debug("code_logic expansion search failed: %s", e)
+
         return {
-            "callees":  [by_fqn[f] for f in callee_fqns  if f in by_fqn],
-            "callers":  [by_fqn[f] for f in caller_fqns  if f in by_fqn],
-            "siblings": [by_fqn[f] for f in sibling_fqns if f in by_fqn],
+            "callees":         [by_fqn[f] for f in callee_fqns  if f in by_fqn],
+            "callers":         [by_fqn[f] for f in caller_fqns  if f in by_fqn],
+            "siblings":        [by_fqn[f] for f in sibling_fqns if f in by_fqn],
+            "code_logic_hits": code_logic_hits,
         }
 
     # ── Throw sites (for debug command) ──────────────────────────────────────

@@ -13,8 +13,6 @@ from __future__ import annotations
 import argparse, re, sys, logging, time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from neo4j import GraphDatabase
-
 from config.settings import settings
 from pipeline.orchestrator import IngestionPipeline
 
@@ -23,12 +21,14 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.WARNING),
     format=settings.log_format,
 )
-# Subsystems at INFO regardless so the user sees routing / retrieval decisions
-for _ns in (
-    "reasoning.pipeline", "reasoning.map_step", "reasoning.reduce_step",
-    "reasoning.router", "reasoning.graph_retriever",
+# Silence noisy third-party HTTP/SDK loggers regardless of LOG_LEVEL
+for _noisy in (
+    "httpcore", "httpx", "openai", "openai._base_client",
+    "urllib3", "requests", "chromadb", "sentence_transformers",
+    "huggingface_hub", "huggingface_hub.utils._http", "transformers",
+    "filelock", "torch",
 ):
-    logging.getLogger(_ns).setLevel(logging.INFO)
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 
@@ -208,7 +208,11 @@ def query(question: str, candidates: int = 20, threshold: int = 70,
 
     # ── STEP 3: Map step (SEMANTIC route only) or deterministic summaries ─────
     map_results = []
-    is_semantic = route_result.route in ("semantic", "symbolic_fallback")
+    # All multi-route results (hybrid_* labels) and pure semantic/fallback routes
+    # use ChromaDB vector search and need the map step + code expansion.
+    # Only purely symbolic/exact/global routes skip it.
+    _NON_SEMANTIC_ROUTES = {"symbolic", "exact", "global", "global_l2", "failed"}
+    is_semantic = route_result.route not in _NON_SEMANTIC_ROUTES
 
     if is_semantic:
         map_step    = MapStep(chroma, llm, n_candidates=candidates,
@@ -339,24 +343,34 @@ def query(question: str, candidates: int = 20, threshold: int = 70,
         # if none of the callees reads/propagates an existing value, that absence
         # is visible directly in the evidence.
         if code_snippets:
-            from reasoning.graph_retriever import GraphRetriever as _GR
-            _gexp = _GR(chroma_client=chroma)
+            from graph.sqlite_retriever import SqliteRetriever as _GR
+            _gexp = _GR(db_path=settings.sqlite_db_path, chroma_client=chroma)
             try:
                 _seed_fqns: list[str] = []
 
-                # grep snippets carry fqn="line N" (not a Java FQN), so extract
-                # the class name from the file path (e.g. "ImpersonatedAccessTokenClaimProvider")
-                # and look it up by name in Neo4j — that's what _find_in_graph supports.
+                # Priority 1: use graph seed_nodes already identified by the router
+                # (entity lookup hits like TokenExchangeGrantHandler) — these are
+                # more precise than grep→class-name derivation from Constants files.
+                for _rn in route_result.seed_nodes:
+                    if _rn.get("fqn") and _rn["fqn"] not in _seed_fqns:
+                        # Skip pure Constants/utility classes — they're not implementation seeds
+                        _rn_cls = _rn["fqn"].split(".")[-1] if "." in _rn["fqn"] else _rn["fqn"]
+                        if not _rn_cls.endswith("Constants") and not _rn_cls.endswith("Utils"):
+                            _seed_fqns.append(_rn["fqn"])
+
+                # Priority 2: derive class names from keyword-grep snippet file paths
+                # (catches implementation classes that the entity lookup missed)
                 _seen_class_names: set[str] = set()
                 for _gs in code_snippets[:8]:
                     fp = _gs.file_path or ""
-                    # Extract Java class name from the file path (strip .java)
-                    # Extract Java class name from the file path (strip .java extension)
                     _basename = fp.replace("\\", "/").split("/")[-1]
                     _cls = _basename[:-5] if _basename.endswith(".java") else _basename
-                    if _cls and _cls not in _seen_class_names and not _cls.startswith("["):
+                    if (_cls and _cls not in _seen_class_names
+                            and not _cls.startswith("[")
+                            and not _cls.endswith("Constants")
+                            and not _cls.endswith("Utils")):
                         _seen_class_names.add(_cls)
-                        _class_nodes = _gexp._find_in_graph(_cls)
+                        _class_nodes = _gexp.find_nodes(_cls)
                         for _cn in _class_nodes:
                             if _cn.get("fqn") and _cn["fqn"] not in _seed_fqns:
                                 _seed_fqns.append(_cn["fqn"])
@@ -407,8 +421,8 @@ def query(question: str, candidates: int = 20, threshold: int = 70,
         if semantic_hits:
             sem_fqns = [t["fqn"] for t in semantic_hits if t.get("fqn")]
             if sem_fqns:
-                from reasoning.graph_retriever import GraphRetriever
-                _enricher = GraphRetriever()
+                from graph.sqlite_retriever import SqliteRetriever as GraphRetriever
+                _enricher = GraphRetriever(db_path=settings.sqlite_db_path)
                 try:
                     enriched_nodes = _enricher.find_nodes_by_fqns(sem_fqns[:15])
                 finally:
@@ -479,8 +493,8 @@ def query(question: str, candidates: int = 20, threshold: int = 70,
         # Non-capability semantic route: enrich semantic hits + always keyword grep
         sem_fqns = [t["fqn"] for t in semantic_hits if t.get("fqn")]
         if sem_fqns:
-            from reasoning.graph_retriever import GraphRetriever
-            _enricher2 = GraphRetriever()
+            from graph.sqlite_retriever import SqliteRetriever as GraphRetriever
+            _enricher2 = GraphRetriever(db_path=settings.sqlite_db_path)
             try:
                 enriched_nodes2 = _enricher2.find_nodes_by_fqns(sem_fqns[:15])
             finally:
@@ -718,14 +732,14 @@ def _print_code_box(snip) -> None:
 
 
 def _connect() -> tuple:
-    """Return (chroma_client, llm_client, GraphRetriever, CodeFetcher)."""
+    """Return (chroma_client, llm_client, SqliteRetriever, CodeFetcher)."""
     import chromadb
     from openai import OpenAI
-    from reasoning.graph_retriever import GraphRetriever
+    from graph.sqlite_retriever import SqliteRetriever
     from reasoning.code_fetcher import CodeFetcher
     chroma  = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
     llm     = settings.make_llm_client()
-    gr      = GraphRetriever(chroma_client=chroma)
+    gr      = SqliteRetriever(db_path=settings.sqlite_db_path, chroma_client=chroma)
     fetcher = CodeFetcher()
     return chroma, llm, gr, fetcher
 

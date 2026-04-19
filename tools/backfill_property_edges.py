@@ -24,11 +24,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from neo4j import GraphDatabase
 from config.settings import settings
 from parsers.uir import Component, LogicUnit, Parameter, FieldDeclaration
 from pipeline.ingest import run_parallel_parse
-from graph.loader import Neo4jLoader
+from graph.sqlite_loader import SQLiteLoader
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,8 +38,8 @@ logger = logging.getLogger("backfill_property_edges")
 
 
 def main() -> None:
-    driver = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
-    loader = Neo4jLoader(driver)
+    loader = SQLiteLoader()
+    loader.open()
 
     mirror_root = settings.repos_mirror_path
     repo_dirs = sorted(d for d in mirror_root.iterdir() if d.is_dir())

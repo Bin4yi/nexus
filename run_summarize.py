@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sqlite3
 import sys
 
 logging.basicConfig(
@@ -30,42 +31,36 @@ def main():
     args = parser.parse_args()
 
     import chromadb
-    from neo4j import GraphDatabase
     from config.settings import settings
-    from graph.gds_client import GDSClient
+    from graph.igraph_community import IGraphCommunityClient
     from community.summarizer import CommunitySummarizer
     from community.global_rollup import GlobalRollup
 
-    driver = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
     chroma = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
 
-    # Get community IDs with size >= min_size
-    logger.info("Fetching community IDs with size >= %d ...", args.min_size)
-    with driver.session() as s:
-        rows = list(s.run(
+    # Fetch community IDs with size >= min_size from SQLite
+    logger.info("Fetching community IDs with size >= %d from SQLite ...", args.min_size)
+    with sqlite3.connect(str(settings.sqlite_db_path)) as conn:
+        rows = conn.execute(
             """
-            MATCH (n) WHERE n.community_id IS NOT NULL
-            WITH n.community_id AS cid, count(n) AS cnt
-            WHERE cnt >= $min_size
-            RETURN cid ORDER BY cnt DESC
+            SELECT community_id, COUNT(*) AS cnt
+            FROM   nodes
+            WHERE  community_id IS NOT NULL
+            GROUP  BY community_id
+            HAVING cnt >= ?
+            ORDER  BY cnt DESC
             """,
-            min_size=args.min_size,
-        ))
-    community_ids = [r["cid"] for r in rows]
+            (args.min_size,),
+        ).fetchall()
+    community_ids = [r[0] for r in rows]
     logger.info("Communities to summarize: %d", len(community_ids))
 
-    # Build a minimal GDS client wrapper that only uses Neo4j (not GDS projection)
-    gds_client = GDSClient(driver)
-
-    # Run summarizer on filtered community IDs
-    summarizer = CommunitySummarizer(
-        gds_client=gds_client,
-        chroma_client=chroma,
-    )
+    igraph_comm = IGraphCommunityClient()
+    summarizer  = CommunitySummarizer(gds_client=igraph_comm, chroma_client=chroma)
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     summaries = []
-    failed = 0
+    failed    = 0
     with ThreadPoolExecutor(max_workers=settings.summarizer_max_workers) as executor:
         future_to_cid = {
             executor.submit(summarizer.summarize_community, cid): cid
@@ -77,29 +72,29 @@ def main():
                 s = future.result()
                 summaries.append(s)
                 if i % 10 == 0 or i == len(community_ids):
-                    logger.info("[%d/%d] done  community %d (%d nodes)",
-                                i, len(community_ids), cid, s.node_count)
+                    logger.info(
+                        "[%d/%d] done  community %d (%d nodes)",
+                        i, len(community_ids), cid, s.node_count,
+                    )
             except Exception as e:
                 failed += 1
                 logger.error("Failed community %d: %s", cid, e)
 
     logger.info("Summaries generated: %d  |  failed: %d", len(summaries), failed)
-    logger.info("community_summaries collection: %d items",
-                chroma.get_collection("community_summaries").count())
+    logger.info(
+        "community_summaries collection: %d items",
+        chroma.get_collection("community_summaries").count(),
+    )
 
     if args.skip_rollup:
-        driver.close()
         return
 
-    # Run L2 + L3 rollup
     logger.info("=== Running L2/L3 hierarchical rollup ===")
     rollup = GlobalRollup(chroma_client=chroma)
     l3 = rollup.run_full_rollup()
     logger.info("L2 domains: %d", len(l3.l2_domains))
     logger.info("L3 token count: %d", l3.token_count)
     logger.info("L3 preview: %s", l3.summary_text[:200])
-
-    driver.close()
     logger.info("Done.")
 
 

@@ -20,20 +20,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
-from neo4j import Driver
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
-from neo4j.exceptions import ServiceUnavailable, SessionExpired
-
-from config.settings import settings
-
 logger = logging.getLogger(__name__)
 
-_flow_retry = retry(
-    retry=retry_if_exception_type((ServiceUnavailable, SessionExpired, ConnectionError)),
-    stop=stop_after_attempt(settings.retry_max_attempts),
-    wait=wait_exponential(multiplier=settings.retry_backoff_seconds, min=1, max=30),
-    reraise=True,
-)
+# No-op decorator (replaces the removed tenacity @_flow_retry)
+def _flow_retry(fn):
+    return fn
 
 # Relationship types to project for shortest-path analysis.
 # Only execution-flow edges — no utility/metadata edges.
@@ -84,11 +75,12 @@ class FlowPath:
 
 class FlowExtractor:
     """
-    Uses Neo4j GDS Dijkstra Shortest Path to extract linear execution
-    flows from EntryPoint → DataSink without combinatorial explosion.
+    Legacy Neo4j GDS Dijkstra flow extractor.
+    Superseded by SQLiteFlowExtractor (graph/sqlite_flow_extractor.py).
+    This class is retained only so that FlowPath can be imported from this module.
     """
 
-    def __init__(self, driver: Driver):
+    def __init__(self, driver=None):
         self.driver = driver
 
     def extract_all_flows(self, max_pairs: int = 200, max_path_length: int = 15) -> list[FlowPath]:
@@ -156,7 +148,6 @@ class FlowExtractor:
 
     # ── Private: GDS operations ───────────────────────────────────────────────
 
-    @_flow_retry
     def _project_flow_graph(self) -> None:
         """Build the GDS in-memory graph for flow extraction."""
         # Drop if exists (cleanup from failed run)
@@ -227,7 +218,6 @@ class FlowExtractor:
                     record["nodeCount"], record["relationshipCount"],
                 )
 
-    @_flow_retry
     def _drop_flow_graph(self) -> None:
         """Drop the flow GDS projection."""
         with self.driver.session() as session:
@@ -239,7 +229,6 @@ class FlowExtractor:
             except Exception as e:
                 logger.debug("GDS projection drop failed (may not exist): %s", e)
 
-    @_flow_retry
     def _get_entry_sink_pairs(self, max_pairs: int) -> list[tuple]:
         """Get (startNodeId, endNodeId, startFqn, endFqn) pairs."""
         with self.driver.session() as session:
@@ -262,7 +251,6 @@ class FlowExtractor:
                 for r in result
             ]
 
-    @_flow_retry
     def _get_sinks_for_entry(self, entry_fqn: str, max_sinks: int) -> list[tuple]:
         """Get sinks reachable from a specific entry point."""
         with self.driver.session() as session:
@@ -283,7 +271,6 @@ class FlowExtractor:
                 for r in result
             ]
 
-    @_flow_retry
     def _extract_single_flow(
         self, start_id: int, end_id: int, start_fqn: str, end_fqn: str,
     ) -> Optional[FlowPath]:
@@ -334,7 +321,6 @@ class FlowExtractor:
                 path_length=len(path_fqns),
             )
 
-    @_flow_retry
     def _resolve_node_ids(self, session, node_ids: list[int]) -> list[dict]:
         """Resolve a list of Neo4j internal node IDs to their properties."""
         result = session.run(

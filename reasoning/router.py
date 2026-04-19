@@ -278,12 +278,23 @@ class LLMQueryParser:
 
         "symbols — UPPER_SNAKE_CASE constant names AND lowercase string literals to grep for.\n"
         "  Derive likely names from the question context, even when not explicitly stated.\n"
+        "  CRITICAL: Use the exact grammatical form found in Java code.\n"
+        "    Prefer the gerund/verb form (IMPERSONATING, VALIDATING, REFRESHING) over the noun\n"
+        "    form (IMPERSONATION, VALIDATION, REFRESH) when naming constants — Java constants\n"
+        "    typically use the gerund of the action they represent.\n"
+        "    Always include BOTH the constant AND any related token/type constants for the concept.\n"
         "  Examples:\n"
         "    'actor token'          → [ACTOR_TOKEN, actor_token, MAY_ACT, ACTOR_TOKEN_TYPE]\n"
         "    'token exchange flow'  → [TOKEN_EXCHANGE, SUBJECT_TOKEN_TYPE, ACTOR_TOKEN_TYPE]\n"
         "    'impersonating actor'  → [IMPERSONATING_ACTOR, impersonating_actor]\n"
         "    'may act claim'        → [MAY_ACT, may_act]\n"
         "    'subject token'        → [SUBJECT_TOKEN, SUBJECT_TOKEN_TYPE, subject_token]\n\n"
+        "  CRITICAL: Never invent compound symbols by merging multiple concepts from the question.\n"
+        "    BAD: 'token exchange delegation' → [TOKEN_EXCHANGE_DELEGATION]  (this string does not exist in code)\n"
+        "    BAD: 'nested act sub claims'     → [nested_act_sub_claims]       (invented, will never grep)\n"
+        "    GOOD: extract each concept separately as its shortest real identifier form.\n"
+        "    When a concept maps to a JWT claim name (e.g. 'act', 'sub', 'iss', 'aud'), include the bare\n"
+        "    string literal (e.g. 'act') alongside any constant it may be stored in.\n\n"
 
         "entity_names — CamelCase Java class or method names to look up in the graph.\n"
         "  Derive likely class names even when not explicitly stated.\n"
@@ -627,18 +638,36 @@ class QueryRouter:
         logger.info("Route: SYMBOLIC — grepping for: %s", symbols)
 
         # Step 1 — Lexical grep across mirror
+        # Skip symbols that are too short to be useful grep targets — short tokens
+        # like "act", "sub", "iss" match thousands of irrelevant lines (variable names,
+        # comments, package paths) and pollute evidence with noise.
         all_grep_hits: list[GrepHit] = []
         for sym in symbols:
+            if len(sym) < 5:
+                logger.debug("Skipping short grep symbol '%s' (len=%d < 5)", sym, len(sym))
+                continue
             hits = self.lexical.search(sym, max_hits=settings.grep_max_hits)
             all_grep_hits.extend(hits)
         logger.info("Grep returned %d hits", len(all_grep_hits))
 
         if not all_grep_hits:
-            logger.warning("No grep hits for %s — falling back to semantic", symbols)
-            r = self._semantic_route(question, entity_names)
-            r.route = "symbolic_fallback"
-            r.symbols = symbols
-            return r
+            # Retry with prefix search — catches spelling differences like
+            # IMPERSONATION_ACTOR → IMPERSONATING_ACTOR without domain knowledge.
+            # Uses case-insensitive regex on the first 8 chars of each word.
+            for sym in symbols:
+                hits = self.lexical.search_prefix(sym, max_hits=settings.grep_max_hits)
+                all_grep_hits.extend(hits)
+            if all_grep_hits:
+                logger.info(
+                    "Grep prefix-retry found %d hits for %s (exact spelling had 0 hits)",
+                    len(all_grep_hits), symbols,
+                )
+            else:
+                logger.warning("No grep hits for %s — falling back to semantic", symbols)
+                r = self._semantic_route(question, entity_names)
+                r.route = "symbolic_fallback"
+                r.symbols = symbols
+                return r
 
         # Step 2 — Grep-to-graph bridge
         seed_nodes, seen_fqns = self._grep_to_graph_bridge(all_grep_hits)

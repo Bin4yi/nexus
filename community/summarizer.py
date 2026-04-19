@@ -49,7 +49,6 @@ class CommunitySummarizer:
     ):
         import chromadb
         from openai import OpenAI
-        from graph.gds_client import GDSClient
         self.gds_client = gds_client
         self.chroma = chroma_client
         self.llm = llm_client or settings.make_llm_client()

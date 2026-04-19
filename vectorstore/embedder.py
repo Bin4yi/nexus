@@ -36,22 +36,47 @@ class ChromaEmbedder:
     """
 
     def __init__(self, client):
-        import chromadb
+        import os, chromadb
         from chromadb.utils import embedding_functions
+        # Suppress sentence-transformers stdout noise (load reports, tqdm bars)
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         self.client = client
         self._emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=settings.embedding_model
         )
-        self._logic_col = client.get_or_create_collection(
-            name=COLLECTION_CODE_LOGIC,
-            embedding_function=self._emb_fn,
-            metadata={"hnsw:space": "cosine"},
-        )
-        self._intent_col = client.get_or_create_collection(
-            name=COLLECTION_CODE_INTENT,
-            embedding_function=self._emb_fn,
-            metadata={"hnsw:space": "cosine"},
-        )
+        self._logic_col  = self._make_collection(client, COLLECTION_CODE_LOGIC)
+        self._intent_col = self._make_collection(client, COLLECTION_CODE_INTENT)
+
+    def _make_collection(self, client, name: str):
+        """
+        Create/open a ChromaDB collection with int8 scalar quantization.
+        Falls back to plain cosine if the running ChromaDB version does not
+        support the quantization configuration API.
+        """
+        try:
+            col = client.get_or_create_collection(
+                name=name,
+                embedding_function=self._emb_fn,
+                configuration={
+                    "hnsw": {
+                        "space": "cosine",
+                        "quantization": {"type": "int8"},
+                    }
+                },
+            )
+            logger.info("Collection '%s' opened with int8 quantization", name)
+            return col
+        except Exception as exc:
+            logger.debug(
+                "int8 quantization unavailable (%s) — falling back to cosine only", exc
+            )
+            return client.get_or_create_collection(
+                name=name,
+                embedding_function=self._emb_fn,
+                metadata={"hnsw:space": "cosine"},
+            )
 
     def upsert_chunks(self, chunks: list[EmbeddingChunk]) -> None:
         """

@@ -10,9 +10,9 @@ pydantic-settings>=2.0,<3.0
 tree-sitter>=0.20
 tree-sitter-java>=0.20
 
-# ── Graph database (Neo4j) ───────────────────────────────────────────────────
-# Deferred import in fixtures — safe to install on Python 3.14
-neo4j>=5.0,<6.0
+# ── Graph algorithms (igraph + Leiden — replaces Neo4j GDS) ─────────────────
+python-igraph>=0.11
+leidenalg>=0.10
 
 # ── Vector store (ChromaDB) ──────────────────────────────────────────────────
 # Deferred import in fixtures — safe to install on Python 3.14

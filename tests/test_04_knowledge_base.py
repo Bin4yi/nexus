@@ -1,9 +1,13 @@
 """
 tests/test_04_knowledge_base.py
-Gate 4: 10 integration tests for Neo4j loader, GDS Leiden, ChromaDB embedder,
+Gate 4: Integration tests for SQLiteLoader, igraph Leiden, ChromaDB embedder,
 and community summarizer.
 Requires: Docker services running (docker-compose up -d)
 """
+import sqlite3
+import tempfile
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -74,71 +78,68 @@ def test_project(test_module):
     )
 
 
-# ── Test 1-4: Neo4j loader (integration) ─────────────────────────────────────
-
-@pytest.mark.integration
-def test_01_schema_constraints_created(neo4j_session):
-    """Test 1: Schema constraints exist for all node types."""
-    from graph.schema import apply_schema
-    from neo4j import GraphDatabase
-    from config.settings import settings
-    driver = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
-    apply_schema(driver)
-
-    result = neo4j_session.run("SHOW CONSTRAINTS")
-    constraint_names = [r["name"] for r in result]
-    # At least one GEID constraint should exist
-    assert any("geid" in name.lower() for name in constraint_names)
-    driver.close()
+@pytest.fixture(scope="module")
+def tmp_db():
+    """Temporary SQLite database for loader integration tests."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        yield Path(f.name)
 
 
-@pytest.mark.integration
-def test_02_nodes_loaded(neo4j_session, test_project):
-    """Test 2: After loading a project, LogicUnit nodes exist."""
-    from neo4j import GraphDatabase
-    from config.settings import settings
-    from graph.loader import Neo4jLoader
-    driver = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
+# ── Test 1-4: SQLiteLoader (integration) ──────────────────────────────────────
 
-    loader = Neo4jLoader(driver)
+def test_01_schema_created(tmp_db):
+    """Test 1: Schema tables exist after opening SQLiteLoader."""
+    from graph.sqlite_loader import SQLiteLoader
+    loader = SQLiteLoader(db_path=tmp_db)
+    loader.open()
+    with sqlite3.connect(str(tmp_db)) as conn:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+    assert "nodes" in tables
+    assert "calls_edges" in tables
+    assert "structure_edges" in tables
+    assert "repo_meta" in tables
+    loader.close()
+
+
+def test_02_nodes_loaded(tmp_db, test_project):
+    """Test 2: After loading a project, LogicUnit rows exist in nodes table."""
+    from graph.sqlite_loader import SQLiteLoader
+    loader = SQLiteLoader(db_path=tmp_db)
+    loader.open()
     loader.load_project(test_project)
+    with sqlite3.connect(str(tmp_db)) as conn:
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE node_type = 'LogicUnit'"
+        ).fetchone()[0]
+    assert cnt > 0
+    loader.close()
 
-    result = neo4j_session.run(
-        "MATCH (n:LogicUnit {geid: $geid}) RETURN count(n) AS cnt",
-        geid=test_project.modules[0].components[0].logic_units[0].geid,
-    )
-    assert result.single()["cnt"] > 0
-    driver.close()
 
-
-@pytest.mark.integration
-def test_03_load_idempotent(neo4j_session, test_project):
+def test_03_load_idempotent(tmp_db, test_project):
     """Test 3: Loading the same project twice doesn't create duplicates."""
-    from neo4j import GraphDatabase
-    from config.settings import settings
-    from graph.loader import Neo4jLoader
-    driver = GraphDatabase.driver(settings.neo4j_uri, auth=settings.neo4j_auth)
-    loader = Neo4jLoader(driver)
-
-    loader.load_project(test_project)  # second load
-    result = neo4j_session.run(
-        "MATCH (n:Project {geid: $geid}) RETURN count(n) AS cnt",
-        geid=test_project.geid,
-    )
-    assert result.single()["cnt"] == 1   # still exactly 1
-    driver.close()
+    from graph.sqlite_loader import SQLiteLoader
+    loader = SQLiteLoader(db_path=tmp_db)
+    loader.open()
+    loader.load_project(test_project)  # second load — INSERT OR REPLACE
+    with sqlite3.connect(str(tmp_db)) as conn:
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE fqn = 'com.test.Auth'"
+        ).fetchone()[0]
+    assert cnt == 1   # still exactly 1
+    loader.close()
 
 
-@pytest.mark.integration
-def test_04_hierarchy_edges_created(neo4j_session, test_project):
-    """Test 4: Module→Component→LogicUnit edges exist."""
-    result = neo4j_session.run(
-        """
-        MATCH (:Module)-[:DECLARES]->(:Component)-[:HAS_METHOD]->(lu:LogicUnit)
-        RETURN count(lu) AS cnt
-        """
-    )
-    assert result.single()["cnt"] >= 1
+def test_04_sha_tracking(tmp_db):
+    """Test 4: get/set_ingested_sha round-trips correctly."""
+    from graph.sqlite_loader import SQLiteLoader
+    loader = SQLiteLoader(db_path=tmp_db)
+    loader.open()
+    loader.set_ingested_sha("my-repo", "abc123def456")
+    sha = loader.get_ingested_sha("my-repo")
+    assert sha == "abc123def456"
+    loader.close()
 
 
 # ── Test 5-7: Chunker (unit) ──────────────────────────────────────────────────
@@ -180,7 +181,6 @@ def test_07_no_intent_chunk_without_docstring():
 
 def test_08_community_prompt_under_budget():
     """Test 8: Community prompt never exceeds the 6800-token data budget."""
-    # Use 500 nodes × 500-char docstrings to guarantee budget overflow and truncation
     nodes = [
         {"fqn": f"com.example.Service{i}.method{i}", "kind": "method",
          "docstring": "A" * 500}
@@ -188,7 +188,7 @@ def test_08_community_prompt_under_budget():
     ]
     prompt, truncated = build_community_prompt(community_id=1, nodes=nodes)
     assert count_tokens(prompt) <= DATA_BUDGET
-    assert truncated is True   # 500 nodes × 500 chars → must have truncated
+    assert truncated is True
 
 
 # ── Test 9-10: ChromaDB embedder (integration) ────────────────────────────────
@@ -200,26 +200,26 @@ def test_09_chunks_upserted_to_chromadb(chroma_client, test_logic_unit):
     from vectorstore.embedder import ChromaEmbedder
 
     embedder = ChromaEmbedder(chroma_client)
-    chunker = UIRChunker()
-    chunks = chunker.chunk_logic_unit(test_logic_unit)
+    chunker  = UIRChunker()
+    chunks   = chunker.chunk_logic_unit(test_logic_unit)
     embedder.upsert_chunks(chunks)
 
-    # Verify intent chunk is retrievable
     result = embedder.get_by_geid(test_logic_unit.geid, collection="code_intent")
     assert result is not None
     assert result["geid"] == test_logic_unit.geid
 
 
 @pytest.mark.integration
-def test_10_geid_bridge_intact(neo4j_session, chroma_client, test_logic_unit):
-    """Test 10: GEID in ChromaDB corresponds to a valid Neo4j node."""
+def test_10_geid_bridge_intact(chroma_client, test_logic_unit, tmp_db):
+    """Test 10: GEID in ChromaDB corresponds to a valid SQLite node."""
     from vectorstore.embedder import ChromaEmbedder
+    import sqlite3
     embedder = ChromaEmbedder(chroma_client)
-    result = embedder.get_by_geid(test_logic_unit.geid)
+    result   = embedder.get_by_geid(test_logic_unit.geid)
 
     if result:  # GEID is in ChromaDB
-        neo4j_result = neo4j_session.run(
-            "MATCH (n {geid: $geid}) RETURN count(n) AS cnt",
-            geid=result["geid"],
-        )
-        assert neo4j_result.single()["cnt"] >= 1   # exists in Neo4j too
+        with sqlite3.connect(str(tmp_db)) as conn:
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE geid = ?", (result["geid"],)
+            ).fetchone()[0]
+        assert cnt >= 1   # exists in SQLite too

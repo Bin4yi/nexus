@@ -117,6 +117,59 @@ class LexicalSearcher:
         )
         return hits[:max_hits]
 
+    def search_prefix(
+        self,
+        symbol: str,
+        max_hits: int | None = None,
+    ) -> list[GrepHit]:
+        """
+        Case-insensitive prefix search for each underscore-separated word in *symbol*.
+
+        Used as a fallback when exact search returns 0 hits — catches spelling
+        variations like IMPERSONATION_ACTOR → IMPERSONATING_ACTOR by searching
+        for the first 8 chars of each word case-insensitively via ripgrep regex.
+
+        Returns deduplicated hits capped at *max_hits*.
+        """
+        max_hits = max_hits or settings.grep_max_hits
+        words = [w for w in symbol.upper().split("_") if len(w) >= 4]
+        if not words:
+            return []
+
+        # Build a regex that matches any line containing all prefix fragments
+        # e.g. IMPERSONATION_ACTOR → (?i)IMPERSONAT.*ACTOR
+        prefixes = [w[:8] for w in words]
+        pattern = ".*".join(prefixes)
+
+        seen: set[str] = set()
+        hits: list[GrepHit] = []
+        for root in ([MIRROR_ROOT] if MIRROR_ROOT.exists() else []):
+            try:
+                cmd = [
+                    "rg",
+                    "--ignore-case",
+                    "--line-number",
+                    "--no-heading",
+                    "--with-filename",
+                    "--max-count", str(max_hits),
+                    pattern,
+                    str(root),
+                ]
+                result = subprocess.run(
+                    cmd, capture_output=True, timeout=30,
+                    encoding="utf-8", errors="replace",
+                )
+                for hit in self._parse_rg_output(result.stdout, symbol):
+                    key = f"{hit.rel_path}:{hit.line_number}"
+                    if key not in seen:
+                        seen.add(key)
+                        hits.append(hit)
+                        if len(hits) >= max_hits:
+                            break
+            except (FileNotFoundError, Exception):
+                pass
+        return hits[:max_hits]
+
     def search_repos(
         self,
         symbol: str,
