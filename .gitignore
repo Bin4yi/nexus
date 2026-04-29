@@ -137,3 +137,27 @@ requirements-lock.txt
 # ── MyPy / Pyright caches ─────────────────────────────────────────────────────
 .mypy_cache/
 .nexus_watch_hashes.json
+
+# ── SQLite database (generated during ingestion, not source) ─────────────────
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Generated graph visualizations ───────────────────────────────────────────
+*.html
+
+# ── RFC source files (large text, fetch from rfc-editor.org on demand) ───────
+rfcs/
+
+# ── Blog drafts (published separately, not part of the codebase) ─────────────
+blog/
+
+# ── IDE LSP artifacts ─────────────────────────────────────────────────────────
+.metals/
+
+# ── Claude Code settings (local tooling config, not project config) ──────────
+.claude/
+
+# ── Venv man pages (created by ensurepip) ────────────────────────────────────
+share/
